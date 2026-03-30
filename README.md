@@ -50,11 +50,21 @@ Never skip the plan step. A 5-minute plan prevents a 2-hour refactor.
 
 ---
 
+## Tests
+
+```bash
+/tdd                  # write tests first (RED → GREEN → refactor)
+/e2e                  # run end-to-end tests for critical user flows
+/test-coverage        # verify coverage is ≥ 80%
+```
+
+---
+
 ## Before Every Commit
 
 ```bash
 /code-review          # catch quality issues
-/security-scan        # if touching auth, user input, or credentials
+/security-review      # if touching auth, user input, or credentials
 ```
 
 Commit format:
@@ -79,7 +89,7 @@ refactor: what you restructured
 
 ```bash
 /instinct-status      # see what patterns Claude has learned from your sessions
-/security-scan        # before anything goes near production
+/security-review      # before anything goes near production
 ```
 
 ---
@@ -89,6 +99,6 @@ refactor: what you restructured
 ```
 New feature    → /plan first, always
 Implementing   → You steer, Claude writes, /tdd enforced
-Before commit  → /code-review + /security-scan if needed
+Before commit  → /code-review + /security-review if needed
 Stuck          → Expected vs. actual, "why" before "fix"
 ```
