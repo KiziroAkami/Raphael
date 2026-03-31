@@ -75,15 +75,16 @@ pm2 restart raphael         # restart after code changes
 pm2 stop raphael            # stop the bot
 ```
 
-**Manual wiki sync** *(if you want to sync outside the daily cron):*
-```bash
-python scripts/build_index.py --incremental
-```
+**Index management:**
 
-**Full re-index** *(if you want to re-fetch everything from scratch):*
-```bash
-python scripts/build_index.py --refresh
-```
+| Command | When to use |
+|---------|-------------|
+| `python scripts/build_index.py --incremental` | New or edited wiki pages since last run (runs automatically at 03:00 — use this to trigger manually outside the cron) |
+| `python scripts/build_index.py --cached` | Re-index from the local disk cache without hitting the wiki API (useful after code changes to the chunker/indexer) |
+| `python scripts/build_index.py --refresh` | Force re-fetch every page from the wiki and rebuild the index from scratch |
+| `python scripts/build_index.py` | First-time full build only — fetches all pages, skipping any already on disk |
+
+> **Note:** `--incremental` picks up both new pages and edits via the MediaWiki `recentchanges` API. It is the right command whenever you want to pull in anything that changed on the wiki since the last sync.
 
 ---
 
