@@ -158,6 +158,18 @@ When adding tests: use pytest, target 80% coverage, write tests first (TDD).
 
 ---
 
+## Bot Restart Policy
+
+After any change that affects output — prompts, speech patterns, retrieval logic, LLM parameters, response formatting, or event handling — **always restart the bot before considering the task done:**
+
+```bash
+pm2 restart raphael
+```
+
+Do not leave the old process running with stale code. If pm2 is not running, note it to the user.
+
+---
+
 ## Task Tracking
 
 Tasks and ideas are tracked in **Linear** under the **Tensura** team, project **Raphael**.
