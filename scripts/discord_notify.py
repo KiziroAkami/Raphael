@@ -44,3 +44,25 @@ def categorise_commit(subject: str) -> tuple[str, str]:
             return category, text[0].upper() + text[1:] if text else text
     cap = subject[0].upper() + subject[1:] if subject else subject
     return "Updated", cap
+
+
+def first_sentence(description: str, max_chars: int = 120) -> str:
+    """Extract the first meaningful line from a description."""
+    for line in description.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and not line.startswith("-"):
+            return line[:max_chars]
+    return description[:max_chars]
+
+
+def _parse_response(tool_response: object) -> dict:
+    """Normalise tool_response to a dict — handles both dict and JSON string."""
+    if isinstance(tool_response, dict):
+        return tool_response
+    if isinstance(tool_response, str):
+        try:
+            result = json.loads(tool_response)
+            return result if isinstance(result, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
