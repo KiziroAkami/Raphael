@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from rag.scraper import fetch_all_pages, fetch_updated_pages, get_last_updated, load_cached_pages, set_last_updated
+from rag.scraper import fetch_all_pages, fetch_missing_pages, fetch_updated_pages, get_last_updated, load_cached_pages, set_last_updated
 from rag.indexer import build_index, reindex_page
 
 
@@ -26,16 +26,26 @@ def main() -> None:
             sys.exit(1)
         print(f"Incremental update — checking for changes since {since}...")
         updated_pages = fetch_updated_pages(since)
-        if not updated_pages:
+        missing_pages = fetch_missing_pages()
+
+        # Merge: updated takes precedence over missing if a title appears in both
+        merged: dict[str, dict] = {p["title"]: p for p in missing_pages}
+        merged.update({p["title"]: p for p in updated_pages})
+        pages_to_index = list(merged.values())
+
+        if not pages_to_index:
             print("Index is already up to date.")
             set_last_updated()
             return
-        print(f"\nRe-indexing {len(updated_pages)} changed page(s)...")
-        for page in updated_pages:
+        print(
+            f"\nRe-indexing {len(pages_to_index)} page(s) "
+            f"({len(updated_pages)} changed, {len(missing_pages)} previously missing)..."
+        )
+        for page in pages_to_index:
             print(f"  Updating: {page['title']}")
             reindex_page(page)
         set_last_updated()
-        print(f"Incremental update complete. {len(updated_pages)} page(s) refreshed.")
+        print(f"Incremental update complete. {len(pages_to_index)} page(s) refreshed.")
 
     elif "--cached" in args:
         print("Loading pages from disk cache...")

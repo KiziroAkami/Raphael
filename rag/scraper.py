@@ -117,13 +117,15 @@ def fetch_updated_pages(since: str) -> list[dict]:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     site = connect()
 
+    logger.info("Querying recentchanges since %s", since)
     # recentchanges lists newest→oldest by default; rcend is the cut-off (oldest point)
     changed_titles: set[str] = set()
     for change in site.recentchanges(end=since, dir="older", prop=["title"], type=["edit", "new"]):
         changed_titles.add(change["title"])
 
+    logger.info("recentchanges returned %d title(s): %s", len(changed_titles), ", ".join(sorted(changed_titles)) or "(none)")
     if not changed_titles:
-        logger.info("No pages changed since last update.")
+        logger.info("No pages changed since %s.", since)
         return []
 
     logger.info("Found %d changed page(s): %s", len(changed_titles), ", ".join(sorted(changed_titles)))
@@ -144,6 +146,48 @@ def fetch_updated_pages(since: str) -> list[dict]:
             time.sleep(RATE_DELAY)
         except Exception as e:
             logger.error("[%d/%d] ERROR fetching %r: %s", i, len(changed_titles), title, e)
+
+    return results
+
+
+def fetch_missing_pages() -> list[dict]:
+    """Fetch pages that exist on the wiki but are absent from the local disk cache.
+
+    Compares current wiki page titles against cached filenames to catch pages
+    that predate the stored timestamp and are therefore invisible to recentchanges.
+    Returns a list of page dicts (same format as fetch_all_pages).
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    site = connect()
+
+    wiki_titles = {page.name for page in site.allpages()}
+    missing_titles = {title for title in wiki_titles if not _cache_path(title).exists()}
+
+    logger.info(
+        "Page-list diff: wiki=%d, cached=%d, missing=%d",
+        len(wiki_titles), len(wiki_titles) - len(missing_titles), len(missing_titles),
+    )
+    if not missing_titles:
+        return []
+
+    logger.info("Missing page(s) to fetch: %s", ", ".join(sorted(missing_titles)))
+
+    results = []
+    for i, title in enumerate(sorted(missing_titles), 1):
+        try:
+            wikitext = _fetch_wikitext(site, title)
+            data = {
+                "title": title,
+                "wikitext": wikitext,
+                "url": f"https://{WIKI_HOST}/wiki/{title.replace(' ', '_')}",
+            }
+            path = _cache_path(title)
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            results.append(data)
+            logger.info("[%d/%d] Fetched missing: %s", i, len(missing_titles), title)
+            time.sleep(RATE_DELAY)
+        except Exception as e:
+            logger.error("[%d/%d] ERROR fetching missing %r: %s", i, len(missing_titles), title, e)
 
     return results
 
