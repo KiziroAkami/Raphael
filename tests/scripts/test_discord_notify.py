@@ -8,3 +8,47 @@ import pytest
 
 # Make sure the project root is importable
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from scripts.discord_notify import categorise_commit
+
+
+class TestCategoriseCommit:
+    def test_feat_prefix_returns_added(self):
+        category, text = categorise_commit("feat: add wiki scraper")
+        assert category == "Added"
+        assert text == "Add wiki scraper"
+
+    def test_fix_prefix_returns_fixed(self):
+        category, text = categorise_commit("fix: handle rate limit backoff")
+        assert category == "Fixed"
+        assert text == "Handle rate limit backoff"
+
+    def test_docs_prefix_returns_updated(self):
+        category, text = categorise_commit("docs: clarify index management")
+        assert category == "Updated"
+        assert text == "Clarify index management"
+
+    def test_chore_prefix_returns_updated(self):
+        category, text = categorise_commit("chore: add pm2 config")
+        assert category == "Updated"
+        assert text == "Add pm2 config"
+
+    def test_refactor_prefix_returns_updated(self):
+        category, text = categorise_commit("refactor: split scraper module")
+        assert category == "Updated"
+        assert text == "Split scraper module"
+
+    def test_scoped_feat_strips_scope(self):
+        category, text = categorise_commit("feat(rag): add embeddings")
+        assert category == "Added"
+        assert text == "Add embeddings"
+
+    def test_unknown_prefix_falls_back_to_updated(self):
+        category, text = categorise_commit("wip: half done thing")
+        assert category == "Updated"
+        assert text == "Wip: half done thing"
+
+    def test_no_prefix_falls_back_to_updated(self):
+        category, text = categorise_commit("random commit message")
+        assert category == "Updated"
+        assert text == "Random commit message"
