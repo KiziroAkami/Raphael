@@ -170,6 +170,23 @@ Do not leave the old process running with stale code. If pm2 is not running, not
 
 ---
 
+## Automated Pipeline
+
+Two Claude Code hooks run automatically during sessions — no manual steps needed:
+
+| Trigger | What fires | Discord message |
+|---------|-----------|-----------------|
+| Linear issue marked **Done** | `PostToolUse: mcp__linear__save_issue` | One-liner task notice with Groq-generated summary |
+| `git push` executed | `PostToolUse: Bash` | Changelog categorised by conventional commit prefix |
+
+Both hooks call `scripts/discord_notify.py` and post to channel `1488606233807028275`.
+
+**Hooks are session-bound** — they fire only during active Claude Code sessions. A push made outside Claude Code will not trigger a Discord message.
+
+Hooks are configured in `.claude/settings.local.json` (machine-specific, not committed).
+
+---
+
 ## Task Tracking
 
 Tasks and ideas are tracked in **Linear** under the **Tensura** team, project **Raphael**.
