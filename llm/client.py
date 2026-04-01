@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 
 from groq import Groq, RateLimitError
@@ -43,8 +44,9 @@ def _call(model: str, user_message: str) -> str:
     )
     if not response.choices:
         return _INSUFFICIENT_DATA
-    content = response.choices[0].message.content
-    return content.strip() if content else _INSUFFICIENT_DATA
+    content = response.choices[0].message.content or ""
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    return content if content else _INSUFFICIENT_DATA
 
 
 def answer(question: str, chunks: list[dict]) -> str:
