@@ -40,7 +40,9 @@ def categorise_commit(subject: str) -> tuple[str, str]:
     """Return (category, display_text) for a conventional commit subject."""
     for prefix, category in COMMIT_CATEGORIES.items():
         if subject.startswith(f"{prefix}:") or subject.startswith(f"{prefix}("):
-            colon_idx = subject.index(":")
+            colon_idx = subject.find(":")
+            if colon_idx == -1:
+                break
             text = subject[colon_idx + 1:].strip()
             return category, text[0].upper() + text[1:] if text else text
     cap = subject[0].upper() + subject[1:] if subject else subject

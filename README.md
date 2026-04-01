@@ -54,8 +54,9 @@ pm2 save
 pm2 startup   # follow the printed command to enable auto-start on reboot
 ```
 
-This starts two processes:
-- **raphael** — the Discord bot (wrapped with `caffeinate` to prevent macOS idle sleep)
+This starts three processes:
+- **raphael** — the Discord bot
+- **raphael-caffeinate** — prevents macOS idle/display sleep (`caffeinate -di`)
 - **raphael-sync** — a cron job that runs `--incremental` wiki sync daily at 03:00
 
 > **Sleep note:** `caffeinate -di` prevents idle and display sleep while the bot is running.

@@ -101,6 +101,15 @@ Discord message ("...?")
                     └── llm/prompts.py  (Raphael persona + RAG prompt)
 ```
 
+**PM2 processes** (`ecosystem.config.cjs`):
+
+```
+pm2
+├── raphael              .venv/bin/python main.py        (Discord bot — always running)
+├── raphael-caffeinate   bash scripts/start.sh           (macOS sleep prevention — always running)
+└── raphael-sync         .venv/bin/python build_index.py  (daily wiki sync at 03:00 — one-shot)
+```
+
 ---
 
 ## Code Conventions
@@ -140,12 +149,12 @@ Key values live at module level in their respective files:
 | `PRIMARY_MODEL` | `llm/client.py` | `llama-3.3-70b-versatile` |
 | `FALLBACK_MODEL` | `llm/client.py` | `qwen/qwen3-32b` |
 | `MAX_TOKENS` | `llm/client.py` | 1024 |
-| `TEMPERATURE` | `llm/client.py` | 0.7 |
-| `K_FACTUAL` | `rag/retriever.py` | 5 |
+| `TEMPERATURE` | `llm/client.py` | 0.3 |
+| `K_FACTUAL` | `rag/retriever.py` | 8 |
 | `K_COMPARATIVE` | `rag/retriever.py` | 10 |
 | `RELEVANCE_THRESHOLD` | `rag/retriever.py` | 0.30 |
 | `CHUNK_MAX_TOKENS` | `rag/indexer.py` | 400 |
-| `MIN_CHUNK_CHARS` | `rag/indexer.py` | 80 |
+| `MIN_CHUNK_CHARS` | `rag/indexer.py` | 20 |
 | Embedding model | `rag/indexer.py` | `all-MiniLM-L6-v2` |
 
 ---
@@ -215,3 +224,20 @@ Rules:
 - If the issue is a bugfix to an existing feature, place it in the same milestone as the original feature.
 - If no existing milestone fits, create a new one first — don't leave issues unassigned or in the wrong phase.
 - A feature that requires new retrieval logic (e.g. "list all X", "compare X vs Y") belongs in Phase 3, not Phase 2 — even if triggered by a Phase 2 bug report.
+
+**Labels — always apply at least one:**
+
+| Label | When to use |
+|-------|------------|
+| `Bug` | Something is broken or behaves incorrectly |
+| `Feature` | New capability that doesn't exist yet |
+| `Improvement` | Enhancement to existing behaviour (refactor, optimisation, UX) |
+| `Bot` | Discord event handling, response formatting, user interaction |
+| `LLM` | Prompts, Groq API, model routing, fallback logic |
+| `RAG` | Scraper, indexer, retriever, ChromaDB |
+| `Infrastructure` | PM2, cron, tooling, deployment, project setup |
+| `Testing` | Test coverage, QA, verification |
+
+Rules:
+- Apply the *type* label (`Bug`, `Feature`, or `Improvement`) AND the *component* label (`Bot`, `LLM`, `RAG`, `Infrastructure`, `Testing`) where applicable.
+- A single issue can and should carry multiple labels (e.g. a retrieval bug gets `Bug` + `RAG`).
