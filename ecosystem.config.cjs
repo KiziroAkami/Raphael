@@ -2,14 +2,23 @@ module.exports = {
   apps: [
     {
       name: 'raphael',
-      script: 'scripts/start.sh',   // caffeinate wrapper — prevents macOS idle sleep
-      interpreter: 'bash',
+      script: 'main.py',
+      interpreter: '.venv/bin/python',
       cwd: __dirname,
       restart_delay: 5000,
       max_restarts: 10,
+      treekill: true,        // kill child processes (e.g. executor threads) on stop/restart
       env: {
         PYTHONUNBUFFERED: '1',
       },
+    },
+    {
+      name: 'raphael-caffeinate',
+      script: 'scripts/start.sh',   // prevent macOS idle sleep — runs independently of bot process
+      interpreter: 'bash',
+      cwd: __dirname,
+      autorestart: false,
+      watch: false,
     },
     {
       name: 'raphael-sync',
