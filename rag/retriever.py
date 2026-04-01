@@ -2,6 +2,7 @@ import logging
 
 from sentence_transformers import SentenceTransformer
 from rag.indexer import get_collection, EMBED_MODEL
+from llm.client import expand_query
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ GENERIC_PAGE_BLOCKLIST: frozenset[str] = frozenset({
     "Tensura: Reincarnated Wiki/about",
     "Tensura: Reincarnated Wiki",
     "Abilities",
+    "Effects",
     "Mobs",
     "Config",
     "Commands",
@@ -120,36 +122,45 @@ def query(question: str) -> list[dict]:
     embedder = _get_embedder()
     k = K_COMPARATIVE if is_comparative(question) else K_FACTUAL
 
-    # Anchor the query to the mod domain to avoid drifting toward anime content
-    anchored = QUERY_PREFIX + question
-    embedding = embedder.encode(anchored).tolist()
+    # Expand the query to cover vocabulary mismatches (e.g. "tame" → "charm/subjugate").
+    # Falls back to the original query only if expansion fails.
+    variants = [question] + expand_query(question)
+    logger.debug("Query variants (%d): %s", len(variants), variants)
 
-    results = collection.query(
-        query_embeddings=[embedding],
-        n_results=k,
-        include=["documents", "metadatas", "distances"],
-    )
+    # Run each variant through ChromaDB and merge results, keeping the highest
+    # score per unique chunk (deduplication by chunk text).
+    seen: dict[str, dict] = {}  # text → best chunk dict so far
 
-    chunks = []
-    documents = results["documents"][0]
-    metadatas = results["metadatas"][0]
-    distances = results["distances"][0]  # cosine distance: 0 = identical, 2 = opposite
+    for variant in variants:
+        anchored = QUERY_PREFIX + variant
+        embedding = embedder.encode(anchored).tolist()
 
-    for text, meta, dist in zip(documents, metadatas, distances):
-        # Convert cosine distance to similarity score (1 = perfect, 0 = unrelated)
-        score = 1.0 - (dist / 2.0)
-        if score < RELEVANCE_THRESHOLD:
-            continue
-        page_title = meta.get("page_title", "")
-        if page_title in GENERIC_PAGE_BLOCKLIST:
-            logger.debug("Filtered generic page: %r (score=%.3f)", page_title, score)
-            continue
-        chunks.append({
-            "text": text,
-            "page_title": page_title,
-            "section": meta.get("section", ""),
-            "url": meta.get("url", ""),
-            "score": round(score, 3),
-        })
+        results = collection.query(
+            query_embeddings=[embedding],
+            n_results=k,
+            include=["documents", "metadatas", "distances"],
+        )
 
-    return chunks
+        for text, meta, dist in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        ):
+            score = 1.0 - (dist / 2.0)  # cosine distance → similarity
+            if score < RELEVANCE_THRESHOLD:
+                continue
+            page_title = meta.get("page_title", "")
+            if page_title in GENERIC_PAGE_BLOCKLIST:
+                continue
+            # Keep the entry only if it improves on what we already have
+            if text not in seen or score > seen[text]["score"]:
+                seen[text] = {
+                    "text": text,
+                    "page_title": page_title,
+                    "section": meta.get("section", ""),
+                    "url": meta.get("url", ""),
+                    "score": round(score, 3),
+                }
+
+    # Return top-K sorted by score descending
+    return sorted(seen.values(), key=lambda c: c["score"], reverse=True)[:k]

@@ -52,6 +52,42 @@ def _call(model: str, user_message: str) -> str:
     return content
 
 
+def expand_query(question: str) -> list[str]:
+    """Return 2–3 wiki-vocabulary rephrasing of the question for multi-shot retrieval.
+
+    Used to bridge vocabulary gaps between player language ("tame mobs") and wiki
+    terminology ("charm", "subjugate"). Returns an empty list on any failure so the
+    caller can fall back to the original query without interruption.
+    """
+    client = _get_client()
+    try:
+        response = client.chat.completions.create(
+            model=PRIMARY_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "You are helping search a Tensura Minecraft mod wiki.\n"
+                        f"User query: {question}\n\n"
+                        "Write 2-3 alternative phrasings of this query using wiki-style "
+                        "terminology (stat names, skill/ability names, game mechanics). "
+                        "One phrasing per line. No numbering, no explanation."
+                    ),
+                }
+            ],
+            max_tokens=80,
+            temperature=0.3,
+        )
+        if not response.choices:
+            return []
+        content = response.choices[0].message.content or ""
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        return [line.strip() for line in content.splitlines() if line.strip()][:3]
+    except Exception:
+        logger.warning("Query expansion failed — using original query only")
+        return []
+
+
 def answer(question: str, chunks: list[dict]) -> str:
     """Generate a Raphael-persona answer grounded in the retrieved chunks.
 
