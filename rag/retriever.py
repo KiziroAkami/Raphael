@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 QUERY_PREFIX = "In the Tensura Minecraft mod, "
 RELEVANCE_THRESHOLD = 0.30   # chunks below this score are discarded
-K_FACTUAL = 5
+K_FACTUAL = 8
 K_COMPARATIVE = 10
 
 # Keywords that signal the user wants a comparison or recommendation

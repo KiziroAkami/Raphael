@@ -9,7 +9,7 @@ from llm.prompts import RAPHAEL_SYSTEM_PROMPT, build_rag_prompt
 PRIMARY_MODEL = "llama-3.3-70b-versatile"
 FALLBACK_MODEL = "qwen/qwen3-32b"
 MAX_TOKENS = 1024
-TEMPERATURE = 0.7
+TEMPERATURE = 0.3
 
 _client: Groq | None = None
 logger = logging.getLogger(__name__)
@@ -46,7 +46,10 @@ def _call(model: str, user_message: str) -> str:
         return _INSUFFICIENT_DATA
     content = response.choices[0].message.content or ""
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-    return content if content else _INSUFFICIENT_DATA
+    if not content:
+        return _INSUFFICIENT_DATA
+    logger.debug("LLM response [%s]: %s", model, content[:200])
+    return content
 
 
 def answer(question: str, chunks: list[dict]) -> str:
