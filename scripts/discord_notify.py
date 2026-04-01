@@ -66,3 +66,87 @@ def _parse_response(tool_response: object) -> dict:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def post_discord(message: str) -> bool:
+    """POST a message to the configured Discord channel."""
+    if not DISCORD_TOKEN:
+        print("DISCORD_TOKEN missing — skipping Discord post", file=sys.stderr)
+        return False
+    try:
+        resp = requests.post(
+            DISCORD_API,
+            headers={
+                "Authorization": f"Bot {DISCORD_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"content": message},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Discord POST failed: {e}", file=sys.stderr)
+        return False
+
+
+def groq_summarise(description: str) -> str | None:
+    """Ask Groq to summarise a Linear issue description as a changelog one-liner."""
+    if not GROQ_API_KEY:
+        return None
+    try:
+        resp = requests.post(
+            GROQ_API,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Summarise the following Linear issue description as a single concise "
+                            "changelog sentence (max 120 characters). Write in past tense, starting "
+                            "with a verb (Added, Fixed, Updated, etc.). "
+                            "No bullet points, no headers, no trailing period.\n\n"
+                            f"{description}"
+                        ),
+                    }
+                ],
+                "max_tokens": 80,
+                "temperature": 0.3,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"Groq summarise failed: {e}", file=sys.stderr)
+        return None
+
+
+def handle_done(payload: dict) -> None:
+    """Handle mcp__linear__save_issue PostToolUse — post notice when state is Done."""
+    response = _parse_response(payload.get("tool_response"))
+    if response.get("status") != "Done":
+        return
+
+    issue_id: str = response.get("id", "")
+    title: str = response.get("title", "")
+    description: str = response.get("description", "")
+
+    if not issue_id or not title:
+        return
+
+    summary: str | None = groq_summarise(description) if description else None
+    if not summary and description:
+        summary = first_sentence(description)
+
+    if summary:
+        message = f"✅ **[{issue_id}]** {title}\n{summary}"
+    else:
+        message = f"✅ **[{issue_id}]** {title}"
+
+    post_discord(message)
