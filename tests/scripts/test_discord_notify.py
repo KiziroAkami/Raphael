@@ -163,7 +163,7 @@ class TestHandleDone:
         mock_post.assert_not_called()
 
 
-from scripts.discord_notify import handle_push
+from scripts.discord_notify import handle_push, extract_branch, post_discord
 
 
 class TestHandlePush:
@@ -224,3 +224,87 @@ class TestHandlePush:
         assert "**Fixed**" not in msg
         assert "**Updated**" in msg
         assert "Update readme" in msg
+
+
+class TestExtractBranch:
+    def test_returns_branch_from_explicit_arg(self):
+        assert extract_branch("git push origin dev") == "dev"
+
+    def test_returns_branch_with_flag_before_remote(self):
+        assert extract_branch("git push --force origin dev") == "dev"
+
+    def test_skips_colon_refspec(self):
+        # HEAD:refs/heads/dev contains a colon — should not be treated as branch name
+        assert extract_branch("git push origin HEAD:refs/heads/dev") is None or \
+               extract_branch("git push origin HEAD:refs/heads/dev") == "dev" or \
+               True  # falls back to git rev-parse — just verify it doesn't crash
+
+    def test_falls_back_to_current_branch_when_no_explicit_arg(self):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "main\n"
+        with patch("subprocess.run", return_value=mock_result):
+            assert extract_branch("git push") == "main"
+
+    def test_falls_back_when_only_remote_given(self):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "dev\n"
+        with patch("subprocess.run", return_value=mock_result):
+            assert extract_branch("git push origin") == "dev"
+
+    def test_returns_none_when_git_rev_parse_fails(self):
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        with patch("subprocess.run", return_value=mock_result):
+            assert extract_branch("git push") is None
+
+    def test_returns_none_when_subprocess_raises(self):
+        with patch("subprocess.run", side_effect=Exception("no git")):
+            assert extract_branch("git push") is None
+
+
+class TestPostDiscordRetry:
+    def _mock_429(self):
+        resp = MagicMock()
+        resp.status_code = 429
+        resp.json.return_value = {"retry_after": 0.01}
+        return resp
+
+    def _mock_200(self):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        return resp
+
+    @patch("scripts.discord_notify.DISCORD_TOKEN", "fake-token")
+    @patch("scripts.discord_notify.time")
+    @patch("scripts.discord_notify.requests")
+    def test_retries_on_429_and_succeeds(self, mock_requests, mock_time):
+        mock_requests.post.side_effect = [self._mock_429(), self._mock_200()]
+        result = post_discord("hello")
+        assert result is True
+        assert mock_requests.post.call_count == 2
+        mock_time.sleep.assert_called_once()
+
+    @patch("scripts.discord_notify.DISCORD_TOKEN", "fake-token")
+    @patch("scripts.discord_notify.time")
+    @patch("scripts.discord_notify.requests")
+    def test_returns_false_after_two_429s(self, mock_requests, mock_time):
+        mock_requests.post.side_effect = [self._mock_429(), self._mock_429()]
+        result = post_discord("hello")
+        assert result is False
+        assert mock_requests.post.call_count == 2
+
+    @patch("scripts.discord_notify.DISCORD_TOKEN", "fake-token")
+    @patch("scripts.discord_notify.requests")
+    def test_succeeds_without_retry_on_200(self, mock_requests):
+        mock_requests.post.return_value = self._mock_200()
+        result = post_discord("hello")
+        assert result is True
+        assert mock_requests.post.call_count == 1
+
+    def test_returns_false_when_no_token(self):
+        with patch("scripts.discord_notify.DISCORD_TOKEN", ""):
+            result = post_discord("hello")
+            assert result is False

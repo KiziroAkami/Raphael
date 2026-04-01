@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -69,25 +70,37 @@ def _parse_response(tool_response: object) -> dict:
 
 
 def post_discord(message: str) -> bool:
-    """POST a message to the configured Discord channel."""
+    """POST a message to the configured Discord channel.
+
+    Retries once on HTTP 429 using the retry_after value from Discord's response body.
+    """
     if not DISCORD_TOKEN:
         print("DISCORD_TOKEN missing — skipping Discord post", file=sys.stderr)
         return False
-    try:
-        resp = requests.post(
-            DISCORD_API,
-            headers={
-                "Authorization": f"Bot {DISCORD_TOKEN}",
-                "Content-Type": "application/json",
-            },
-            json={"content": message},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        print(f"Discord POST failed: {e}", file=sys.stderr)
-        return False
+    headers = {
+        "Authorization": f"Bot {DISCORD_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                DISCORD_API,
+                headers=headers,
+                json={"content": message},
+                timeout=10,
+            )
+            if resp.status_code == 429:
+                wait = float(resp.json().get("retry_after", 1))
+                print(f"Discord rate limited — retrying in {wait}s", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"Discord POST failed: {e}", file=sys.stderr)
+            return False
+    print("Discord POST failed after retry", file=sys.stderr)
+    return False
 
 
 def groq_summarise(description: str) -> str | None:
@@ -147,11 +160,13 @@ def get_commits_since_origin(branch: str) -> list[str]:
 def extract_branch(command: str) -> str | None:
     """Extract branch name from a git push command, falling back to current branch."""
     parts = command.split()
-    # Try to parse positional branch arg: git push <remote> <branch>
-    if len(parts) >= 4:
-        for part in parts[3:]:
-            if not part.startswith("-") and ":" not in part:
-                return part
+    # Collect positional args after "git push", skipping flags and refspecs.
+    # Skip flags and refspecs (e.g. :branch = delete, local:remote = explicit mapping).
+    # HEAD:refs/heads/branch form used in some CI pipelines will not match — acceptable trade-off.
+    positional = [p for p in parts[2:] if not p.startswith("-") and ":" not in p]
+    # positional[0] = remote, positional[1] = branch (if explicitly given)
+    if len(positional) >= 2:
+        return positional[1]
     # Fall back to current branch
     try:
         result = subprocess.run(
