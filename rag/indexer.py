@@ -14,7 +14,7 @@ EMBED_MODEL = "all-MiniLM-L6-v2"
 MAX_CHUNK_TOKENS = 400   # ~1,600 chars; hard cap per chunk
 CHARS_PER_TOKEN = 4      # rough estimate for splitting
 MAX_CHUNK_CHARS = MAX_CHUNK_TOKENS * CHARS_PER_TOKEN
-MIN_CHUNK_CHARS = 10     # skip near-empty chunks (parsing artifacts only)
+MIN_CHUNK_CHARS = 20     # skip near-empty chunks (stubs, placeholders, leaked headings)
 
 # Templates whose key=value pairs contain game stats worth indexing.
 # These are converted to "Key: Value\n..." text instead of being stripped.
@@ -54,6 +54,19 @@ def _get_chroma_client() -> chromadb.PersistentClient:
 
 def get_collection() -> chromadb.Collection:
     return _get_chroma_client().get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
+def reset_collection() -> None:
+    """Drop and recreate the collection — use before a full rebuild to clear stale chunks."""
+    client = _get_chroma_client()
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except chromadb.errors.NotFoundError:
+        pass
+    client.create_collection(
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
@@ -221,6 +234,11 @@ def build_chunks(page: dict) -> list[dict]:
     title = page["title"]
     url = page["url"]
     wikitext = page["wikitext"]
+
+    # Skip redirect pages — they produce useless "#REDIRECT [[Target]]" chunks
+    # that crowd out real content in retrieval results
+    if wikitext.strip().upper().startswith("#REDIRECT"):
+        return []
 
     chunks = []
 

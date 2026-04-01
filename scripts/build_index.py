@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from rag.scraper import fetch_all_pages, fetch_missing_pages, fetch_updated_pages, get_last_updated, load_cached_pages, set_last_updated
-from rag.indexer import build_index, reindex_page
+from rag.indexer import build_index, reindex_page, reset_collection
 
 
 def main() -> None:
@@ -53,6 +53,8 @@ def main() -> None:
         if not pages:
             print("No cached pages found. Run without --cached to fetch from wiki.")
             sys.exit(1)
+        print("Resetting collection...")
+        reset_collection()
         print(f"\nBuilding index for {len(pages)} pages...")
         build_index(pages)
         set_last_updated()
@@ -64,6 +66,8 @@ def main() -> None:
         if not pages:
             print("No pages to index.")
             sys.exit(1)
+        print("Resetting collection...")
+        reset_collection()
         print(f"\nBuilding index for {len(pages)} pages...")
         build_index(pages)
         set_last_updated()
