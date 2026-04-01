@@ -25,6 +25,7 @@ GENERIC_PAGE_BLOCKLIST: frozenset[str] = frozenset({
     "Abilities",
     "Mobs",
     "Config",
+    "Commands",
     "Crafting",
     "Skills",
     "Magic",

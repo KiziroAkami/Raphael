@@ -146,7 +146,12 @@ def groq_summarise(description: str) -> str | None:
             timeout=15,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        data = resp.json()
+        choices = data.get("choices", [])
+        if not choices:
+            return None
+        content = choices[0].get("message", {}).get("content")
+        return content.strip() if content else None
     except Exception as e:
         print(f"Groq summarise failed: {e}", file=sys.stderr)
         return None

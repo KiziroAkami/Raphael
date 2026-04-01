@@ -196,3 +196,22 @@ Tasks and ideas are tracked in **Linear** under the **Tensura** team, project **
 - When starting work on an issue, set its status to **In Progress**.
 - When finishing, mark it **Done**.
 - Do not batch issues up for later. Create them the moment they are identified.
+
+**Milestone placement — think before assigning:**
+
+Every issue must be placed in the correct milestone. Use the existing milestones as a guide:
+
+| Milestone | What belongs here |
+|-----------|------------------|
+| Phase 0 — Setup Cleanup | Tooling, CI, config, dependency hygiene, infra housekeeping |
+| Phase 1 — RAG Infrastructure | Core scraping, indexing, chunking, ChromaDB wiring |
+| Phase 2 — Hardening | Reliability, rate limits, error handling, async safety |
+| Phase 2 — Simple Recitation | Bot responds correctly to basic factual questions |
+| Phase 2 — Answer Quality | Retrieval quality bugs: wrong chunks, missing data, bad scoring |
+| Phase 3 — Advanced Reasoning | Enumeration queries, comparisons, multi-entity reasoning |
+| Phase 4 — Chatbot Persona | Persona polish, fallback behaviour, non-wiki questions |
+
+Rules:
+- If the issue is a bugfix to an existing feature, place it in the same milestone as the original feature.
+- If no existing milestone fits, create a new one first — don't leave issues unassigned or in the wrong phase.
+- A feature that requires new retrieval logic (e.g. "list all X", "compare X vs Y") belongs in Phase 3, not Phase 2 — even if triggered by a Phase 2 bug report.
