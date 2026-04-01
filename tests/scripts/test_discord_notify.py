@@ -94,16 +94,20 @@ class TestParseResponse:
 
 class TestHandleDone:
     def _payload(self, status: str = "Done", issue_id: str = "TEN-41",
-                 title: str = "Add Discord hooks", description: str = "Some description.") -> dict:
+                 title: str = "Add Discord hooks", description: str = "Some description.",
+                 milestone: str | None = None) -> dict:
+        tool_response: dict = {
+            "id": issue_id,
+            "title": title,
+            "status": status,
+            "description": description,
+        }
+        if milestone is not None:
+            tool_response["projectMilestone"] = {"name": milestone}
         return {
             "tool_name": "mcp__linear__save_issue",
             "tool_input": {"id": issue_id, "state": status},
-            "tool_response": {
-                "id": issue_id,
-                "title": title,
-                "status": status,
-                "description": description,
-            },
+            "tool_response": tool_response,
         }
 
     @patch("scripts.discord_notify.post_discord")
@@ -115,6 +119,20 @@ class TestHandleDone:
         assert "TEN-41" in msg
         assert "Add Discord hooks" in msg
         assert "Added PostToolUse hooks for Discord." in msg
+
+    @patch("scripts.discord_notify.post_discord")
+    @patch("scripts.discord_notify.groq_summarise", return_value="Added PostToolUse hooks for Discord.")
+    def test_includes_milestone_when_present(self, mock_groq, mock_post):
+        handle_done(self._payload(milestone="Phase 2 — Hardening"))
+        msg = mock_post.call_args[0][0]
+        assert "Phase 2 — Hardening" in msg
+
+    @patch("scripts.discord_notify.post_discord")
+    @patch("scripts.discord_notify.groq_summarise", return_value="Added PostToolUse hooks for Discord.")
+    def test_omits_milestone_when_absent(self, mock_groq, mock_post):
+        handle_done(self._payload())
+        msg = mock_post.call_args[0][0]
+        assert "`" not in msg.split("\n")[0]  # no backtick label on the header line
 
     @patch("scripts.discord_notify.post_discord")
     def test_skips_when_not_done(self, mock_post):

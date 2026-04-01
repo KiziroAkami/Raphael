@@ -212,6 +212,7 @@ def handle_done(payload: dict) -> None:
     issue_id: str = response.get("id", "")
     title: str = response.get("title", "")
     description: str = response.get("description", "")
+    milestone: str = (response.get("projectMilestone") or {}).get("name", "")
 
     if not issue_id or not title:
         return
@@ -220,11 +221,11 @@ def handle_done(payload: dict) -> None:
     if not summary and description:
         summary = first_sentence(description)
 
-    if summary:
-        message = f"✅ **[{issue_id}]** {title}\n{summary}"
-    else:
-        message = f"✅ **[{issue_id}]** {title}"
+    header = f"✅ **[{issue_id}]** {title}"
+    if milestone:
+        header += f" · `{milestone}`"
 
+    message = f"{header}\n{summary}" if summary else header
     post_discord(message)
 
 
