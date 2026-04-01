@@ -143,3 +143,66 @@ class TestHandleDone:
         payload["tool_response"]["id"] = ""
         handle_done(payload)
         mock_post.assert_not_called()
+
+
+from scripts.discord_notify import handle_push
+
+
+class TestHandlePush:
+    def _payload(self, command: str) -> dict:
+        return {
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_response": {"output": ""},
+        }
+
+    @patch("scripts.discord_notify.post_discord")
+    @patch("scripts.discord_notify.get_commits_since_origin", return_value=["feat: add scraper", "fix: handle 429"])
+    @patch("scripts.discord_notify.extract_branch", return_value="dev")
+    def test_posts_changelog_on_push(self, mock_branch, mock_commits, mock_post):
+        handle_push(self._payload("git push origin dev"))
+        mock_post.assert_called_once()
+        msg = mock_post.call_args[0][0]
+        assert "**Added**" in msg
+        assert "Add scraper" in msg
+        assert "**Fixed**" in msg
+        assert "Handle 429" in msg
+
+    @patch("scripts.discord_notify.post_discord")
+    def test_skips_non_push_command(self, mock_post):
+        handle_push(self._payload("git status"))
+        mock_post.assert_not_called()
+
+    @patch("scripts.discord_notify.post_discord")
+    def test_skips_dry_run(self, mock_post):
+        handle_push(self._payload("git push origin dev --dry-run"))
+        mock_post.assert_not_called()
+
+    @patch("scripts.discord_notify.post_discord")
+    def test_skips_branch_delete_colon(self, mock_post):
+        handle_push(self._payload("git push origin :dev"))
+        mock_post.assert_not_called()
+
+    @patch("scripts.discord_notify.post_discord")
+    def test_skips_branch_delete_flag(self, mock_post):
+        handle_push(self._payload("git push origin --delete dev"))
+        mock_post.assert_not_called()
+
+    @patch("scripts.discord_notify.post_discord")
+    @patch("scripts.discord_notify.get_commits_since_origin", return_value=[])
+    @patch("scripts.discord_notify.extract_branch", return_value="dev")
+    def test_skips_when_no_commits(self, mock_branch, mock_commits, mock_post):
+        handle_push(self._payload("git push origin dev"))
+        mock_post.assert_not_called()
+
+    @patch("scripts.discord_notify.post_discord")
+    @patch("scripts.discord_notify.get_commits_since_origin", return_value=["docs: update readme"])
+    @patch("scripts.discord_notify.extract_branch", return_value="dev")
+    def test_omits_empty_sections(self, mock_branch, mock_commits, mock_post):
+        handle_push(self._payload("git push origin dev"))
+        mock_post.assert_called_once()
+        msg = mock_post.call_args[0][0]
+        assert "**Added**" not in msg
+        assert "**Fixed**" not in msg
+        assert "**Updated**" in msg
+        assert "Update readme" in msg

@@ -127,6 +127,82 @@ def groq_summarise(description: str) -> str | None:
         return None
 
 
+def get_commits_since_origin(branch: str) -> list[str]:
+    """Return commit subjects between origin/branch and HEAD."""
+    try:
+        result = subprocess.run(
+            ["git", "log", f"origin/{branch}..{branch}", "--pretty=format:%s"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    except Exception as e:
+        print(f"git log failed: {e}", file=sys.stderr)
+        return []
+
+
+def extract_branch(command: str) -> str | None:
+    """Extract branch name from a git push command, falling back to current branch."""
+    parts = command.split()
+    # Try to parse positional branch arg: git push <remote> <branch>
+    if len(parts) >= 4:
+        for part in parts[3:]:
+            if not part.startswith("-") and ":" not in part:
+                return part
+    # Fall back to current branch
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def handle_push(payload: dict) -> None:
+    """Handle Bash PostToolUse — post changelog when command is a git push."""
+    tool_input = payload.get("tool_input", {})
+    command: str = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+
+    parts = command.split()
+    if not (len(parts) >= 2 and parts[0] == "git" and parts[1] == "push"):
+        return
+    if "--dry-run" in parts:
+        return
+    if any(p.startswith(":") for p in parts) or "--delete" in parts or "-d" in parts:
+        return
+
+    branch = extract_branch(command)
+    if not branch:
+        return
+
+    commits = get_commits_since_origin(branch)
+    if not commits:
+        return
+
+    buckets: dict[str, list[str]] = {"Added": [], "Updated": [], "Fixed": []}
+    for subject in commits:
+        category, text = categorise_commit(subject)
+        buckets[category].append(text)
+
+    lines = [f"📦 **Changelog** · `{branch}`"]
+    for section in ("Added", "Updated", "Fixed"):
+        if buckets[section]:
+            lines.append(f"\n**{section}**")
+            for item in buckets[section]:
+                lines.append(f"- {item}")
+
+    post_discord("\n".join(lines))
+
+
 def handle_done(payload: dict) -> None:
     """Handle mcp__linear__save_issue PostToolUse — post notice when state is Done."""
     response = _parse_response(payload.get("tool_response"))
