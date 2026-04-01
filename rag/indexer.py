@@ -14,7 +14,7 @@ EMBED_MODEL = "all-MiniLM-L6-v2"
 MAX_CHUNK_TOKENS = 400   # ~1,600 chars; hard cap per chunk
 CHARS_PER_TOKEN = 4      # rough estimate for splitting
 MAX_CHUNK_CHARS = MAX_CHUNK_TOKENS * CHARS_PER_TOKEN
-MIN_CHUNK_CHARS = 80     # skip near-empty chunks
+MIN_CHUNK_CHARS = 10     # skip near-empty chunks (parsing artifacts only)
 
 # Templates whose key=value pairs contain game stats worth indexing.
 # These are converted to "Key: Value\n..." text instead of being stripped.
@@ -97,8 +97,9 @@ def _clean_wikitext(raw: str) -> str:
     text = re.sub(r"<ref[^>]*>.*?</ref>", "", text, flags=re.DOTALL)
     text = re.sub(r"<ref[^>]*/?>", "", text)
 
-    # Remove HTML comments
+    # Remove HTML comments and tags
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", "", text)
 
     # DescriptionEcho: {{DescriptionEcho|Some plain text.}} → the plain text
     text = re.sub(r"\{\{DescriptionEcho\|([^}]+)\}\}", r"\1", text, flags=re.IGNORECASE)
@@ -135,9 +136,10 @@ def _clean_wikitext(raw: str) -> str:
     # Strip wiki links but keep display text: [[Page|Display]] → Display, [[Page]] → Page
     text = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]+)\]\]", r"\1", text)
 
-    # Strip external links: [http://... text] → text
+    # Strip external links: [http://... text] → text, bare URLs → removed
     text = re.sub(r"\[https?://\S+\s+([^\]]+)\]", r"\1", text)
     text = re.sub(r"\[https?://\S+\]", "", text)
+    text = re.sub(r"https?://\S+", "", text)  # bare URLs (e.g. Tutorial Video sections)
 
     # Strip remaining wiki markup
     text = re.sub(r"'{2,3}", "", text)   # bold/italic
@@ -238,14 +240,19 @@ def build_chunks(page: dict) -> list[dict]:
         })
 
     # 2. Section chunks
+    # Context prefix is prepended to every section chunk so that short sections
+    # (e.g. "0 - 2 Leather\n0 - 2 Bones") embed near relevant queries
+    # ("what does Goblin drop?") rather than floating in unrelated vector space.
     for section_name, raw_section in _split_sections(wikitext):
         clean = _clean_wikitext(raw_section)
         if len(clean) < MIN_CHUNK_CHARS:
             continue
-        for part in _split_long_text(clean, MAX_CHUNK_CHARS):
+        context_prefix = f"{title} — {section_name}:\n"
+        max_body = MAX_CHUNK_CHARS - len(context_prefix)
+        for part in _split_long_text(clean, max_body):
             if len(part) >= MIN_CHUNK_CHARS:
                 chunks.append({
-                    "text": part,
+                    "text": context_prefix + part,
                     "page_title": title,
                     "section": section_name,
                     "url": url,

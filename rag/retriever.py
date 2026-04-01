@@ -17,6 +17,21 @@ COMPARATIVE_KEYWORDS = {
     "top", "ranking", "rank", "optimal", "most", "least",
 }
 
+# Pages that are broad mod overviews or navigation hubs — they score high for
+# almost any query and crowd out specific content pages.
+GENERIC_PAGE_BLOCKLIST: frozenset[str] = frozenset({
+    "Tensura: Reincarnated Wiki/about",
+    "Tensura: Reincarnated Wiki",
+    "Abilities",
+    "Mobs",
+    "Config",
+    "Crafting",
+    "Skills",
+    "Magic",
+    "Races",
+    "Items",
+})
+
 # Words that indicate a structured question, not a bare entity lookup
 _QUESTION_STARTERS = {
     "how", "what", "why", "where", "when", "is", "are", "does",
@@ -124,9 +139,13 @@ def query(question: str) -> list[dict]:
         score = 1.0 - (dist / 2.0)
         if score < RELEVANCE_THRESHOLD:
             continue
+        page_title = meta.get("page_title", "")
+        if page_title in GENERIC_PAGE_BLOCKLIST:
+            logger.debug("Filtered generic page: %r (score=%.3f)", page_title, score)
+            continue
         chunks.append({
             "text": text,
-            "page_title": meta.get("page_title", ""),
+            "page_title": page_title,
             "section": meta.get("section", ""),
             "url": meta.get("url", ""),
             "score": round(score, 3),
