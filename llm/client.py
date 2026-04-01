@@ -88,23 +88,24 @@ def expand_query(question: str) -> list[str]:
         return []
 
 
-def answer(question: str, chunks: list[dict]) -> str:
+def answer(question: str, chunks: list[dict]) -> tuple[str, str]:
     """Generate a Raphael-persona answer grounded in the retrieved chunks.
 
     Tries the primary model first; falls back to the secondary on rate limit.
+    Returns (response_text, model_used).
     """
     if not chunks:
-        return _INSUFFICIENT_DATA
+        return _INSUFFICIENT_DATA, "none"
 
     user_message = build_rag_prompt(question, chunks)
 
     try:
-        return _call(PRIMARY_MODEL, user_message)
+        return _call(PRIMARY_MODEL, user_message), PRIMARY_MODEL
     except RateLimitError:
         logger.warning("Rate limit hit on %s, retrying with %s...", PRIMARY_MODEL, FALLBACK_MODEL)
         time.sleep(1)
         try:
-            return _call(FALLBACK_MODEL, user_message)
+            return _call(FALLBACK_MODEL, user_message), FALLBACK_MODEL
         except Exception:
             logger.exception("Fallback model %s also failed", FALLBACK_MODEL)
-            return _INSUFFICIENT_DATA
+            return _INSUFFICIENT_DATA, "none"
