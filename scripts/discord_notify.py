@@ -226,3 +226,35 @@ def handle_done(payload: dict) -> None:
         message = f"✅ **[{issue_id}]** {title}"
 
     post_discord(message)
+
+
+def main() -> None:
+    if "--mode" not in sys.argv:
+        print("Usage: discord_notify.py --mode done|push", file=sys.stderr)
+        sys.exit(0)
+
+    mode_idx = sys.argv.index("--mode")
+    if mode_idx + 1 >= len(sys.argv):
+        print("--mode requires an argument", file=sys.stderr)
+        sys.exit(0)
+
+    mode = sys.argv[mode_idx + 1]
+
+    try:
+        payload = json.load(sys.stdin)
+    except Exception as e:
+        print(f"Failed to parse hook payload: {e}", file=sys.stderr)
+        sys.exit(0)
+
+    if mode == "done":
+        handle_done(payload)
+    elif mode == "push":
+        handle_push(payload)
+    else:
+        print(f"Unknown mode: {mode!r}", file=sys.stderr)
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
