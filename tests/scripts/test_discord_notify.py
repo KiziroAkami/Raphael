@@ -91,6 +91,17 @@ class TestParseResponse:
     def test_returns_empty_dict_on_none(self):
         assert _parse_response(None) == {}
 
+    def test_unwraps_claude_code_hook_list_format(self):
+        # Claude Code PostToolUse hooks wrap MCP responses as [{"type": "text", "text": "..."}]
+        payload = [{"type": "text", "text": '{"id": "TEN-1", "status": "Done"}'}]
+        assert _parse_response(payload) == {"id": "TEN-1", "status": "Done"}
+
+    def test_returns_empty_dict_on_empty_list(self):
+        assert _parse_response([]) == {}
+
+    def test_returns_empty_dict_on_list_with_no_text_item(self):
+        assert _parse_response([{"type": "image", "data": "..."}]) == {}
+
 
 class TestHandleDone:
     def _payload(self, status: str = "Done", issue_id: str = "TEN-41",
@@ -161,6 +172,25 @@ class TestHandleDone:
         payload["tool_response"]["id"] = ""
         handle_done(payload)
         mock_post.assert_not_called()
+
+    @patch("scripts.discord_notify.post_discord")
+    @patch("scripts.discord_notify.groq_summarise", return_value=None)
+    def test_handles_real_hook_list_format(self, mock_groq, mock_post):
+        """Claude Code wraps tool_response in [{"type": "text", "text": "<JSON>"}]."""
+        import json
+        raw = json.dumps({
+            "id": "TEN-41", "title": "Add Discord hooks",
+            "status": "Done", "description": "Some description.",
+        })
+        payload = {
+            "tool_name": "mcp__linear__save_issue",
+            "tool_input": {"id": "TEN-41", "state": "Done"},
+            "tool_response": [{"type": "text", "text": raw}],
+        }
+        handle_done(payload)
+        mock_post.assert_called_once()
+        msg = mock_post.call_args[0][0]
+        assert "TEN-41" in msg
 
 
 from scripts.discord_notify import handle_push, extract_branch, post_discord

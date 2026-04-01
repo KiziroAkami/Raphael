@@ -57,7 +57,19 @@ def first_sentence(description: str, max_chars: int = 120) -> str:
 
 
 def _parse_response(tool_response: object) -> dict:
-    """Normalise tool_response to a dict — handles both dict and JSON string."""
+    """Normalise tool_response to a dict.
+
+    Claude Code hook payloads wrap MCP responses in a content list:
+      [{"type": "text", "text": "<JSON string>"}]
+    This function unwraps that before falling through to dict/string handling.
+    """
+    if isinstance(tool_response, list):
+        for item in tool_response:
+            if isinstance(item, dict) and item.get("type") == "text":
+                tool_response = item.get("text", "")
+                break
+        else:
+            return {}
     if isinstance(tool_response, dict):
         return tool_response
     if isinstance(tool_response, str):
