@@ -9,6 +9,9 @@ from llm.prompts import RAPHAEL_SYSTEM_PROMPT, _sanitize_chunk, build_rag_prompt
 
 PRIMARY_MODEL = "llama-3.3-70b-versatile"
 FALLBACK_MODEL = "qwen/qwen3-32b"
+TERTIARY_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+LAST_RESORT_MODEL = "llama-3.1-8b-instant"
+MODEL_CHAIN: list[str] = [PRIMARY_MODEL, FALLBACK_MODEL, TERTIARY_MODEL, LAST_RESORT_MODEL]
 MAX_TOKENS = 1024
 TEMPERATURE = 0.3
 
@@ -119,7 +122,7 @@ def expand_query(question: str) -> list[str]:
 def answer(question: str, chunks: list[dict]) -> tuple[str, str]:
     """Generate a Raphael-persona answer grounded in the retrieved chunks.
 
-    Tries the primary model first; falls back to the secondary on rate limit.
+    Walks MODEL_CHAIN in order, falling back on RateLimitError.
     Returns (response_text, model_used).
     """
     if not chunks:
@@ -127,18 +130,21 @@ def answer(question: str, chunks: list[dict]) -> tuple[str, str]:
 
     user_message = build_rag_prompt(question, chunks)
 
-    try:
-        return _call(PRIMARY_MODEL, user_message), PRIMARY_MODEL
-    except RateLimitError:
-        with _rate_limit_lock:
-            global _last_rate_limit
-            _last_rate_limit = time.monotonic()
-        logger.warning("Rate limit hit on %s, retrying with %s...", PRIMARY_MODEL, FALLBACK_MODEL)
+    for i, model in enumerate(MODEL_CHAIN):
         try:
-            return _call(FALLBACK_MODEL, user_message), FALLBACK_MODEL
+            return _call(model, user_message), model
         except RateLimitError:
-            logger.error("Fallback model %s also rate-limited", FALLBACK_MODEL)
-            return _API_OVERLOADED, "rate_limited"
+            with _rate_limit_lock:
+                global _last_rate_limit
+                _last_rate_limit = time.monotonic()
+            next_model = MODEL_CHAIN[i + 1] if i + 1 < len(MODEL_CHAIN) else None
+            if next_model:
+                logger.warning("Rate limit hit on %s, retrying with %s...", model, next_model)
+            else:
+                logger.error("All %d models rate-limited", len(MODEL_CHAIN))
+                return _API_OVERLOADED, "rate_limited"
         except Exception:
-            logger.exception("Fallback model %s failed (non-rate-limit)", FALLBACK_MODEL)
+            logger.exception("Model %s failed (non-rate-limit)", model)
             return _API_OVERLOADED, "error"
+
+    return _API_OVERLOADED, "rate_limited"

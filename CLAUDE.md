@@ -13,7 +13,7 @@
 | Layer | Technology |
 |-------|-----------|
 | Discord bot | `discord.py >= 2.3.0` |
-| LLM inference | Groq API (`llama-3.3-70b-versatile` → fallback `qwen/qwen3-32b`) |
+| LLM inference | Groq API (4-model chain: `llama-3.3-70b` → `qwen3-32b` → `llama-4-scout-17b` → `llama-3.1-8b-instant`) |
 | Embeddings | `sentence-transformers` (`all-MiniLM-L6-v2`, local, no API) |
 | Vector store | ChromaDB (persistent, local at `data/chroma/`) |
 | Wiki scraping | `mwclient` (MediaWiki API for `tensura.wiki.gg`) |
@@ -119,7 +119,7 @@ pm2
 - Format: `%(asctime)s %(levelname)s %(name)s: %(message)s`
 
 **Error handling**
-- Graceful degradation: primary model → fallback model → in-character error message
+- Graceful degradation: 4-model fallback chain → in-character error message
 - Rate limit backoff: exponential (30s / 60s / 120s)
 - User-facing errors stay in-character: _"Insufficient data in Raphael's archives"_
 
@@ -148,6 +148,8 @@ Key values live at module level in their respective files:
 |---------|----------|-------|
 | `PRIMARY_MODEL` | `llm/client.py` | `llama-3.3-70b-versatile` |
 | `FALLBACK_MODEL` | `llm/client.py` | `qwen/qwen3-32b` |
+| `TERTIARY_MODEL` | `llm/client.py` | `meta-llama/llama-4-scout-17b-16e-instruct` |
+| `LAST_RESORT_MODEL` | `llm/client.py` | `llama-3.1-8b-instant` |
 | `MAX_TOKENS` | `llm/client.py` | 1024 |
 | `TEMPERATURE` | `llm/client.py` | 0.3 |
 | `K_FACTUAL` | `rag/retriever.py` | 8 |
