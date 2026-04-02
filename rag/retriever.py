@@ -20,9 +20,9 @@ COMPARATIVE_KEYWORDS = {
 
 # Pages that are broad mod overviews or navigation hubs — they score high for
 # almost any query and crowd out specific content pages.
-GENERIC_PAGE_BLOCKLIST: frozenset[str] = frozenset({
-    "Tensura: Reincarnated Wiki/about",
-    "Tensura: Reincarnated Wiki",
+# Exact-match: only the root page is blocked (e.g. "Races" but NOT "Races/Human").
+# Prefix-match: root + all subpages blocked (e.g. "Tensura: Reincarnated Wiki/*").
+_EXACT_BLOCKED: frozenset[str] = frozenset({
     "Abilities",
     "Effects",
     "Mobs",
@@ -34,6 +34,20 @@ GENERIC_PAGE_BLOCKLIST: frozenset[str] = frozenset({
     "Races",
     "Items",
 })
+
+_PREFIX_BLOCKED: tuple[str, ...] = (
+    "Tensura: Reincarnated Wiki",  # blocks /welcome, /links, /contribute, /about
+)
+
+
+def _is_blocked(page_title: str) -> bool:
+    """Return True if a page title is on the blocklist."""
+    if page_title in _EXACT_BLOCKED:
+        return True
+    return any(
+        page_title == p or page_title.startswith(p + "/")
+        for p in _PREFIX_BLOCKED
+    )
 
 # Words that indicate a structured question, not a bare entity lookup
 _QUESTION_STARTERS = {
@@ -78,10 +92,13 @@ def _query_by_page_title(collection, entity: str) -> list[dict]:
     """Return all chunks for a wiki page matching the entity name.
 
     Tries the entity as-is and then title-cased to handle capitalisation variants.
-    Returns an empty list if no matching page is found.
+    Returns an empty list if no matching page is found or if the page is blocked.
     """
     candidates = list(dict.fromkeys([entity, entity.title()]))  # deduplicate, preserve order
     for candidate in candidates:
+        if _is_blocked(candidate):
+            logger.debug("Bare entity %r is on blocklist, skipping", candidate)
+            continue
         result = collection.get(
             where={"page_title": {"$eq": candidate}},
             include=["documents", "metadatas"],
@@ -99,6 +116,47 @@ def _query_by_page_title(collection, entity: str) -> list[dict]:
                 for text, meta in zip(result["documents"], result["metadatas"])
             ]
     return []
+
+
+def _inject_page_title_variant(
+    collection, question: str, variants: list[str],
+) -> None:
+    """If words in the question match a page title, add it as a search variant.
+
+    Prevents common terms ("cooldown", "damage") from drowning entity names
+    ("creator", "predator") in the embedding. Checks 1-, 2-, and 3-word windows
+    from the question against ChromaDB page titles.
+    """
+    words = question.rstrip("?").strip().split()
+    # Skip question-starter words for candidate generation
+    content_words = [w for w in words if w.lower() not in _QUESTION_STARTERS]
+    if not content_words:
+        return
+
+    # Build candidate phrases: single words, bigrams, trigrams
+    candidates: list[str] = []
+    for size in (1, 2, 3):
+        for i in range(len(content_words) - size + 1):
+            phrase = " ".join(content_words[i:i + size])
+            if len(phrase) >= 3:  # skip very short candidates
+                candidates.append(phrase)
+
+    for phrase in candidates:
+        if phrase in variants:
+            continue
+        # Try exact page title match (case-insensitive via title-case)
+        for form in dict.fromkeys([phrase, phrase.title()]):
+            if _is_blocked(form):
+                continue
+            result = collection.get(
+                where={"page_title": {"$eq": form}},
+                include=["metadatas"],
+                limit=1,
+            )
+            if result["ids"]:
+                logger.debug("Page title boost: %r matches page %r", phrase, form)
+                variants.append(form)
+                return  # one boost is enough
 
 
 def query(question: str) -> list[dict]:
@@ -125,6 +183,18 @@ def query(question: str) -> list[dict]:
     # Expand the query to cover vocabulary mismatches (e.g. "tame" → "charm/subjugate").
     # Falls back to the original query only if expansion fails.
     variants = [question] + expand_query(question)
+
+    # TEN-111: If bare entity lookup failed, inject the entity name as a search
+    # variant so semantic search can still find the right page.
+    if entity and entity not in variants:
+        variants.append(entity)
+
+    # TEN-113: If any word(s) in the query match a page title, inject that title
+    # as a variant to prevent common terms from drowning entity names.
+    # Only for structured questions (not bare entities, which are already handled).
+    if not entity:
+        _inject_page_title_variant(collection, question, variants)
+
     logger.debug("Query variants (%d): %s", len(variants), variants)
 
     # Run each variant through ChromaDB and merge results, keeping the highest
@@ -150,7 +220,7 @@ def query(question: str) -> list[dict]:
             if score < RELEVANCE_THRESHOLD:
                 continue
             page_title = meta.get("page_title", "")
-            if page_title in GENERIC_PAGE_BLOCKLIST:
+            if _is_blocked(page_title):
                 continue
             # Keep the entry only if it improves on what we already have
             if text not in seen or score > seen[text]["score"]:

@@ -151,7 +151,7 @@ Key values live at module level in their respective files:
 | `TERTIARY_MODEL` | `llm/client.py` | `meta-llama/llama-4-scout-17b-16e-instruct` |
 | `LAST_RESORT_MODEL` | `llm/client.py` | `llama-3.1-8b-instant` |
 | `MAX_TOKENS` | `llm/client.py` | 1024 |
-| `TEMPERATURE` | `llm/client.py` | 0.3 |
+| `TEMPERATURE` | `llm/client.py` | 0.1 |
 | `K_FACTUAL` | `rag/retriever.py` | 8 |
 | `K_COMPARATIVE` | `rag/retriever.py` | 10 |
 | `RELEVANCE_THRESHOLD` | `rag/retriever.py` | 0.30 |

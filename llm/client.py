@@ -13,7 +13,7 @@ TERTIARY_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 LAST_RESORT_MODEL = "llama-3.1-8b-instant"
 MODEL_CHAIN: list[str] = [PRIMARY_MODEL, FALLBACK_MODEL, TERTIARY_MODEL, LAST_RESORT_MODEL]
 MAX_TOKENS = 1024
-TEMPERATURE = 0.3
+TEMPERATURE = 0.1
 
 _client: Groq | None = None
 logger = logging.getLogger(__name__)
@@ -106,7 +106,7 @@ def expand_query(question: str) -> list[str]:
                 },
             ],
             max_tokens=80,
-            temperature=0.3,
+            temperature=0.3,  # intentionally higher than TEMPERATURE — diversity helps expansion
         )
         if not response.choices:
             return []
