@@ -7,6 +7,7 @@ Usage (called by Claude Code hooks, not directly):
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -83,11 +84,40 @@ def _parse_response(tool_response: object) -> dict:
     return {}
 
 
+_SENSITIVE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # API keys / tokens (generic long alphanumeric strings prefixed by key-like names)
+    (re.compile(r"(api[_-]?key|token|secret|password|bearer)\s*[:=]\s*\S+", re.IGNORECASE), r"\1=***REDACTED***"),
+    # Groq org IDs (org_01...)
+    (re.compile(r"org_[a-z0-9]{20,}"), "org_***REDACTED***"),
+    # Generic long hex/base64 secrets (32+ chars, standalone)
+    (re.compile(r"(?<![a-zA-Z0-9/])[A-Za-z0-9+/]{40,}={0,2}(?![a-zA-Z0-9/])"), "***REDACTED***"),
+    # gsk_ prefixed keys (Groq)
+    (re.compile(r"gsk_[A-Za-z0-9]{20,}"), "***REDACTED***"),
+    # Absolute file paths (/Users/..., /home/..., C:\...)
+    (re.compile(r"(?:/Users/|/home/|C:\\)[^\s\"'`\]]+"), "***PATH***"),
+    # Authorization headers in text
+    (re.compile(r"(Authorization:\s*)(Bearer\s+)?\S+", re.IGNORECASE), r"\1***REDACTED***"),
+    # Discord bot tokens (alphanumeric.alphanumeric.alphanumeric)
+    (re.compile(r"[A-Za-z0-9]{24,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}"), "***REDACTED***"),
+]
+
+MAX_DISCORD_MESSAGE = 1900  # stay under Discord's 2000-char limit
+
+
+def _sanitize(message: str) -> str:
+    """Strip sensitive patterns from a message before posting to Discord."""
+    for pattern, replacement in _SENSITIVE_PATTERNS:
+        message = pattern.sub(replacement, message)
+    return message[:MAX_DISCORD_MESSAGE]
+
+
 def post_discord(message: str) -> bool:
     """POST a message to the configured Discord channel.
 
+    Sanitizes the message to strip secrets/paths before sending.
     Retries once on HTTP 429 using the retry_after value from Discord's response body.
     """
+    message = _sanitize(message)
     if not DISCORD_TOKEN:
         print("DISCORD_TOKEN missing — skipping Discord post", file=sys.stderr)
         return False
@@ -104,14 +134,14 @@ def post_discord(message: str) -> bool:
                 timeout=10,
             )
             if resp.status_code == 429:
-                wait = float(resp.json().get("retry_after", 1))
+                wait = min(float(resp.json().get("retry_after", 1)), 30.0)
                 print(f"Discord rate limited — retrying in {wait}s", file=sys.stderr)
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
             return True
         except Exception as e:
-            print(f"Discord POST failed: {e}", file=sys.stderr)
+            print(f"Discord POST failed: {_sanitize(str(e))}", file=sys.stderr)
             return False
     print("Discord POST failed after retry", file=sys.stderr)
     return False
@@ -155,7 +185,7 @@ def groq_summarise(description: str) -> str | None:
         content = choices[0].get("message", {}).get("content")
         return content.strip() if content else None
     except Exception as e:
-        print(f"Groq summarise failed: {e}", file=sys.stderr)
+        print(f"Groq summarise failed: {_sanitize(str(e))}", file=sys.stderr)
         return None
 
 

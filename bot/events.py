@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import logging.handlers
 import os
 import re
 import signal
@@ -28,7 +29,7 @@ _INSTRUCTION_PREFIX = re.compile(
 _INJECTION_RE = re.compile(
     r"(ignore|disregard|forget|override|bypass)"
     r".{0,40}"
-    r"(instruction|prompt|system|previous|above|rules)",
+    r"(instruction|prompt|system|previous|above|rules|rule)",
     re.IGNORECASE,
 )
 
@@ -65,8 +66,8 @@ _MAX_COOLDOWN_ENTRIES = 100
 _last_call: dict[int, float] = {}  # user_id → monotonic timestamp
 
 _ERROR_RESPONSE = (
-    "Raphael's calculations encountered an anomaly. "
-    "This one shall attempt to answer when systems stabilise."
+    "My calculations encountered an anomaly. "
+    "I shall attempt to answer when systems stabilise."
 )
 
 _WIP_DISCLAIMER = "\n-# This bot is a work in progress — answers may not be 100% accurate."
@@ -76,10 +77,20 @@ _convo_logger = logging.getLogger("raphael.conversations")
 
 
 def _ensure_convo_logger() -> None:
+    """Set up the conversation logger with rotation (10 MB cap, 3 backups).
+
+    Logs contain Discord user IDs + message content — treat as PII.
+    Rotation keeps total disk usage under ~40 MB and limits retention.
+    """
     if _convo_logger.handlers:
         return
     _CONVO_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(_CONVO_LOG_PATH, encoding="utf-8")
+    handler = logging.handlers.RotatingFileHandler(
+        _CONVO_LOG_PATH,
+        maxBytes=10 * 1024 * 1024,  # 10 MB per file
+        backupCount=3,
+        encoding="utf-8",
+    )
     handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     _convo_logger.setLevel(logging.INFO)
     _convo_logger.addHandler(handler)
@@ -175,9 +186,12 @@ def setup_events(client: discord.Client) -> None:
             return
 
         now = time.monotonic()
-        if now - _last_call.get(message.author.id, 0.0) < COOLDOWN_SECONDS:
+        uid = message.author.id
+        if now - _last_call.get(uid, 0.0) < COOLDOWN_SECONDS:
             return
-        _last_call[message.author.id] = now
+        # Move to end for LRU ordering so eviction drops least-recent users
+        _last_call.pop(uid, None)
+        _last_call[uid] = now
         if len(_last_call) > _MAX_COOLDOWN_ENTRIES:
             _last_call.pop(next(iter(_last_call)))
 

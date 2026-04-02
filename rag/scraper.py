@@ -120,7 +120,7 @@ def fetch_updated_pages(since: str) -> list[dict]:
     logger.info("Querying recentchanges since %s", since)
     # recentchanges lists newest→oldest by default; rcend is the cut-off (oldest point)
     changed_titles: set[str] = set()
-    for change in site.recentchanges(end=since, dir="older", prop=["title"], type=["edit", "new"]):
+    for change in site.recentchanges(end=since, dir="older", prop=["title"], type=["edit", "new", "log"]):
         changed_titles.add(change["title"])
 
     logger.info("recentchanges returned %d title(s): %s", len(changed_titles), ", ".join(sorted(changed_titles)) or "(none)")
@@ -188,6 +188,62 @@ def fetch_missing_pages() -> list[dict]:
             time.sleep(RATE_DELAY)
         except Exception as e:
             logger.error("[%d/%d] ERROR fetching missing %r: %s", i, len(missing_titles), title, e)
+
+    return results
+
+
+def prune_stale_redirects() -> list[dict]:
+    """Detect cached pages with full content that are now redirects on the wiki.
+
+    Compares local cache against the wiki's redirect list to find stale files
+    left behind by page renames.  Re-fetches those pages so the cache reflects
+    the current redirect state.  Returns the updated page dicts (callers should
+    pass them through reindex_page to clean up ChromaDB).
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    site = connect()
+
+    wiki_redirects = {page.name for page in site.allpages(filterredir="redirects")}
+    logger.info("Wiki reports %d redirect page(s)", len(wiki_redirects))
+
+    stale: list[str] = []
+    for path in CACHE_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("Could not parse cache file %s: %s", path, e)
+            continue
+        title = data.get("title", "")
+        wikitext = data.get("wikitext", "")
+        if title in wiki_redirects and not wikitext.strip().upper().startswith("#REDIRECT"):
+            stale.append(title)
+
+    if not stale:
+        logger.info("No stale redirect cache files found.")
+        return []
+
+    logger.info(
+        "Found %d stale cache file(s) (now redirects): %s",
+        len(stale), ", ".join(sorted(stale)),
+    )
+
+    results: list[dict] = []
+    for i, title in enumerate(sorted(stale), 1):
+        try:
+            wikitext = _fetch_wikitext(site, title)
+            data = {
+                "title": title,
+                "wikitext": wikitext,
+                "url": f"https://{WIKI_HOST}/wiki/{title.replace(' ', '_')}",
+            }
+            _cache_path(title).write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8",
+            )
+            results.append(data)
+            logger.info("[%d/%d] Updated stale redirect: %s", i, len(stale), title)
+            time.sleep(RATE_DELAY)
+        except Exception as e:
+            logger.error("[%d/%d] ERROR updating %r: %s", i, len(stale), title, e)
 
     return results
 

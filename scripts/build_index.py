@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from rag.scraper import fetch_all_pages, fetch_missing_pages, fetch_updated_pages, get_last_updated, load_cached_pages, set_last_updated
+from rag.scraper import fetch_all_pages, fetch_missing_pages, fetch_updated_pages, get_last_updated, load_cached_pages, prune_stale_redirects, set_last_updated
 from rag.indexer import build_index, reindex_page, reset_collection
 
 
@@ -27,9 +27,11 @@ def main() -> None:
         print(f"Incremental update — checking for changes since {since}...")
         updated_pages = fetch_updated_pages(since)
         missing_pages = fetch_missing_pages()
+        stale_redirects = prune_stale_redirects()
 
-        # Merge: updated takes precedence over missing if a title appears in both
-        merged: dict[str, dict] = {p["title"]: p for p in missing_pages}
+        # Merge: updated takes precedence; stale redirects are lowest priority
+        merged: dict[str, dict] = {p["title"]: p for p in stale_redirects}
+        merged.update({p["title"]: p for p in missing_pages})
         merged.update({p["title"]: p for p in updated_pages})
         pages_to_index = list(merged.values())
 
@@ -39,7 +41,8 @@ def main() -> None:
             return
         print(
             f"\nRe-indexing {len(pages_to_index)} page(s) "
-            f"({len(updated_pages)} changed, {len(missing_pages)} previously missing)..."
+            f"({len(updated_pages)} changed, {len(missing_pages)} previously missing, "
+            f"{len(stale_redirects)} stale redirects)..."
         )
         for page in pages_to_index:
             print(f"  Updating: {page['title']}")
