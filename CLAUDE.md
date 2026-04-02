@@ -183,16 +183,17 @@ Do not leave the old process running with stale code. If pm2 is not running, not
 
 ## Automated Pipeline
 
-Two Claude Code hooks run automatically during sessions — no manual steps needed:
+**Hook (automatic):**
 
 | Trigger | What fires | Discord message |
 |---------|-----------|-----------------|
 | Linear issue marked **Done** | `PostToolUse: mcp__linear__save_issue` | One-liner task notice with Groq-generated summary |
-| `git push` executed | `PostToolUse: Bash` | Changelog categorised by conventional commit prefix |
 
-Both hooks call `scripts/discord_notify.py` and post to channel `1488606233807028275`.
+**Manual (Claude does this after every `git push`):**
 
-**Hooks are session-bound** — they fire only during active Claude Code sessions. A push made outside Claude Code will not trigger a Discord message.
+After pushing, compose a categorised changelog (Added/Updated/Fixed) and send it via `post_discord()` from `scripts/discord_notify.py`. This produces higher-quality changelogs than automated commit-message parsing.
+
+Both post to channel `1488606233807028275`.
 
 Hooks are configured in `.claude/settings.local.json` (machine-specific, not committed).
 

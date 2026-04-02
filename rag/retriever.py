@@ -191,9 +191,9 @@ def query(question: str) -> list[dict]:
 
     # TEN-113: If any word(s) in the query match a page title, inject that title
     # as a variant to prevent common terms from drowning entity names.
-    # Only for structured questions (not bare entities, which are already handled).
-    if not entity:
-        _inject_page_title_variant(collection, question, variants)
+    # Runs for all queries that reach semantic search — including bare entities
+    # whose exact page_title lookup failed (e.g. "creator cooldown?").
+    _inject_page_title_variant(collection, question, variants)
 
     logger.debug("Query variants (%d): %s", len(variants), variants)
 
