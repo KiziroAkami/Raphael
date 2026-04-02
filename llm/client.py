@@ -45,7 +45,11 @@ def _call(model: str, user_message: str) -> str:
     if not response.choices:
         return _INSUFFICIENT_DATA
     content = response.choices[0].message.content or ""
-    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    # Strip complete <think>…</think> blocks (e.g. qwen3-32b extended reasoning)
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+    # Strip truncated (unclosed) <think> blocks — happens when MAX_TOKENS is
+    # exhausted mid-reasoning before the closing tag is produced
+    content = re.sub(r"<think>.*", "", content, flags=re.DOTALL).strip()
     if not content:
         return _INSUFFICIENT_DATA
     logger.debug("LLM response [%s]: %s", model, content[:200])
@@ -81,7 +85,8 @@ def expand_query(question: str) -> list[str]:
         if not response.choices:
             return []
         content = response.choices[0].message.content or ""
-        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+        content = re.sub(r"<think>.*", "", content, flags=re.DOTALL).strip()
         return [line.strip() for line in content.splitlines() if line.strip()][:3]
     except Exception:
         logger.warning("Query expansion failed — using original query only")
