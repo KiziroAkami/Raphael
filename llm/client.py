@@ -4,7 +4,7 @@ import re
 import threading
 import time
 
-from groq import Groq, RateLimitError
+from groq import APIStatusError, Groq, RateLimitError
 from llm.prompts import RAPHAEL_SYSTEM_PROMPT, _sanitize_chunk, build_rag_prompt
 
 PRIMARY_MODEL = "llama-3.3-70b-versatile"
@@ -64,6 +64,12 @@ def _call(model: str, user_message: str) -> str:
     # Strip truncated (unclosed) <think> blocks — happens when MAX_TOKENS is
     # exhausted mid-reasoning before the closing tag is produced
     content = re.sub(r"<think>.*", "", content, flags=re.DOTALL).strip()
+    # Strip markdown headers (### Heading) — some models (llama-4-scout) emit them
+    # despite the system prompt saying "prefer flowing analytical prose"
+    content = re.sub(r"^#{1,4}\s+", "", content, flags=re.MULTILINE)
+    # Strip horizontal rules (---) that some models insert
+    content = re.sub(r"^-{3,}\s*$", "", content, flags=re.MULTILINE)
+    content = re.sub(r"\n{3,}", "\n\n", content).strip()
     if not content:
         return _INSUFFICIENT_DATA
     logger.debug("LLM response [%s]: %s", model, content[:200])
@@ -143,8 +149,21 @@ def answer(question: str, chunks: list[dict]) -> tuple[str, str]:
             else:
                 logger.error("All %d models rate-limited", len(MODEL_CHAIN))
                 return _API_OVERLOADED, "rate_limited"
+        except APIStatusError as e:
+            # 413 Payload Too Large — request exceeds model's TPM limit.
+            # Try next model which may have a higher TPM allowance.
+            if e.status_code == 413:
+                next_model = MODEL_CHAIN[i + 1] if i + 1 < len(MODEL_CHAIN) else None
+                if next_model:
+                    logger.warning("Payload too large for %s (HTTP 413), trying %s...", model, next_model)
+                else:
+                    logger.error("Payload too large for all %d models", len(MODEL_CHAIN))
+                    return _API_OVERLOADED, "payload_too_large"
+            else:
+                logger.exception("Model %s failed (status %d)", model, e.status_code)
+                return _API_OVERLOADED, "error"
         except Exception:
-            logger.exception("Model %s failed (non-rate-limit)", model)
+            logger.exception("Model %s failed (non-API)", model)
             return _API_OVERLOADED, "error"
 
     return _API_OVERLOADED, "rate_limited"

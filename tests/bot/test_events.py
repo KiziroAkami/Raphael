@@ -92,6 +92,32 @@ class TestCleanQueryInjection:
 # _clean_query: edge cases and rejection
 # ---------------------------------------------------------------------------
 
+class TestCleanQueryDiscordMentions:
+    def test_strips_user_mention(self):
+        result = _clean_query("<@123456789> What does Predator do?")
+        assert result == "What does Predator do?"
+
+    def test_strips_multiple_mentions(self):
+        result = _clean_query("<@111> <@222> please check?")
+        assert result == "please check?"
+
+    def test_strips_nickname_mention(self):
+        result = _clean_query("<@!123456789> Predator?")
+        assert result == "Predator?"
+
+    def test_strips_role_mention(self):
+        result = _clean_query("<@&999999> list all races?")
+        assert result == "list all races?"
+
+    def test_strips_channel_mention(self):
+        result = _clean_query("<#123456789> what is this?")
+        assert result == "what is this?"
+
+    def test_mention_only_rejected(self):
+        """Just mentions + question mark → body too short after stripping."""
+        assert _clean_query("<@111> <@222>?") is None
+
+
 class TestCleanQueryEdgeCases:
     def test_rejects_emoji_only(self):
         assert _clean_query("😂😂😂?") is None

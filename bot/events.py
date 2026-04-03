@@ -33,17 +33,22 @@ _INJECTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Discord mention formats: <@id>, <@!id>, <@&id>, <#id>
+_DISCORD_MENTION_RE = re.compile(r"<[@#][!&]?\d+>")
+
 # Minimum chars (excluding trailing ?) after prefix stripping.
 # Set to 2 to allow short entity lookups like "EP?" or "Orc?".
 _MIN_CLEANED_LEN = 2
 
 
 def _clean_query(raw: str) -> str | None:
-    """Strip instruction prefixes and validate the remainder.
+    """Strip instruction prefixes, Discord mentions, and validate the remainder.
 
     Returns the cleaned question, or None if the message should be silently dropped.
     """
-    cleaned = _INSTRUCTION_PREFIX.sub("", raw).strip()
+    cleaned = _DISCORD_MENTION_RE.sub("", raw)
+    cleaned = re.sub(r" {2,}", " ", cleaned).strip()
+    cleaned = _INSTRUCTION_PREFIX.sub("", cleaned).strip()
     body = cleaned.rstrip("?").strip()
 
     if len(body) < _MIN_CLEANED_LEN:

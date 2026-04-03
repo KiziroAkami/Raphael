@@ -1,4 +1,5 @@
 import logging
+import re
 
 from sentence_transformers import SentenceTransformer
 from rag.indexer import get_collection, EMBED_MODEL
@@ -10,6 +11,154 @@ QUERY_PREFIX = "In the Tensura Minecraft mod, "
 RELEVANCE_THRESHOLD = 0.30   # chunks below this score are discarded
 K_FACTUAL = 8
 K_COMPARATIVE = 10
+MAX_ENUM_CHARS = 8000        # char budget for enumeration (breadth — many entries, light stats)
+MAX_COMPARATIVE_CHARS = 16000  # char budget for comparisons (depth — fewer entries, full stats)
+
+# Condensation keyword filters — which infobox lines to keep per entry
+_CONDENSATION_LIGHT = ("Type:", "HP:", "SHP:", "Obtain Cost:", "title:", "MP Range:")
+_CONDENSATION_VERBOSE = (
+    "Type:", "HP:", "SHP:", "Obtain Cost:", "title:", "MP Range:", "AP Range:",
+    "Attack DMG:", "Attack Speed:", "Intrinsics:", "Previous:", "Next:",
+    "Difficulty:", "Majin:", "Spiritual:", "Divine:", "Size:",
+    "Points to Master:", "Knockback Resist:", "Speed:", "Sprint Speed:",
+)
+
+# ---------------------------------------------------------------------------
+# Enumeration detection — "list all X", "what X are there", etc.
+# ---------------------------------------------------------------------------
+
+# Regex patterns that signal an enumeration intent.
+_ENUM_PATTERNS = [
+    re.compile(r"\b(?:list|name|show)\s+(?:all|every|each)\b", re.IGNORECASE),
+    re.compile(r"\b(?:all|every)\s+(?:the\s+)?(?:available\s+)?(\w[\w\s]{1,30})\b", re.IGNORECASE),
+    re.compile(r"\bhow\s+many\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+[\w\s]{0,20}(?:are\s+there|exist|does\s+the\s+mod\s+have)\b", re.IGNORECASE),
+]
+
+# Maps user-facing category terms to retrieval strategies.
+# "prefix:<path>" = fetch all summary chunks whose page_title starts with <path>/
+# "content:<marker>" = fetch all summary chunks whose text contains <marker>
+_CATEGORY_MAP: list[tuple[re.Pattern[str], str]] = [
+    # Skill types (by content marker in summary chunks)
+    (re.compile(r"\buniques?\b|\bunique\s+skills?\b", re.IGNORECASE), "content:Unique Skill"),
+    (re.compile(r"\bextra\s+skills?\b", re.IGNORECASE), "content:Extra Skill"),
+    (re.compile(r"\bcommon\s+skills?\b", re.IGNORECASE), "content:Common Skill"),
+    (re.compile(r"\bintrinsic\s+skills?\b", re.IGNORECASE), "content:Intrinsic Skill"),
+    (re.compile(r"\bresistance\s+skills?\b", re.IGNORECASE), "content:Resistance Skill"),
+    (re.compile(r"\bbattlewills?\b", re.IGNORECASE), "content:Battlewill"),
+    # Prefix-based categories
+    (re.compile(r"\braces?\b", re.IGNORECASE), "prefix:Races"),
+    (re.compile(r"\bmobs?\b", re.IGNORECASE), "prefix:Mobs"),
+    (re.compile(r"\bmagics?\b|\bspells?\b", re.IGNORECASE), "prefix:Abilities/Magics"),
+    (re.compile(r"\beffects?\b|\bstatus\s+effects?\b", re.IGNORECASE), "prefix:Effects"),
+    (re.compile(r"\bblocks?\b", re.IGNORECASE), "prefix:Blocks"),
+    (re.compile(r"\bstructures?\b", re.IGNORECASE), "prefix:Structures"),
+    (re.compile(r"\bschematics?\b", re.IGNORECASE), "prefix:Items/Schematics"),
+    (re.compile(r"\bitems?\b", re.IGNORECASE), "prefix:Items"),
+    # Generic "skills" without qualifier — return all skill types
+    (re.compile(r"\bskills?\b", re.IGNORECASE), "content:Skill"),
+]
+
+
+def _detect_category(question: str) -> str | None:
+    """Return the retrieval strategy if the question mentions a known category, or None."""
+    for pattern, strategy in _CATEGORY_MAP:
+        if pattern.search(question):
+            return strategy
+    return None
+
+
+def _detect_enumeration(question: str) -> str | None:
+    """If the question asks to list/enumerate a category, return the retrieval strategy.
+
+    Returns a string like "prefix:Races" or "content:Unique Skill", or None.
+    """
+    # Must match an enumeration pattern first
+    if not any(p.search(question) for p in _ENUM_PATTERNS):
+        return None
+    return _detect_category(question)
+
+
+def _query_category(collection, strategy: str, verbose: bool = False) -> list[dict]:
+    """Fetch all summary chunks for a category using metadata queries.
+
+    For prefix strategies: fetches all pages whose title starts with the prefix.
+    For content strategies: fetches all summary chunks containing the marker text.
+
+    verbose=False (enumeration): light condensation — name + key identifiers only.
+    verbose=True  (comparison):  rich condensation — full stats, intrinsics, evolution.
+    """
+    kind, value = strategy.split(":", 1)
+
+    if kind == "prefix":
+        # Get all summary chunks for pages under this prefix
+        result = collection.get(
+            where={
+                "$and": [
+                    {"chunk_type": {"$eq": "summary"}},
+                    {"page_title": {"$ne": value}},  # exclude the overview page itself
+                ]
+            },
+            include=["documents", "metadatas"],
+        )
+        # Filter to matching prefix (ChromaDB doesn't support startswith)
+        chunks = [
+            {
+                "text": doc,
+                "page_title": meta.get("page_title", ""),
+                "section": meta.get("section", ""),
+                "url": meta.get("url", ""),
+                "score": 1.0,
+            }
+            for doc, meta in zip(result["documents"], result["metadatas"])
+            if meta.get("page_title", "").startswith(value + "/")
+            and not _is_blocked(meta.get("page_title", ""))
+        ]
+    else:
+        # Content-based: get all summary chunks containing the marker
+        result = collection.get(
+            where={"chunk_type": {"$eq": "summary"}},
+            include=["documents", "metadatas"],
+        )
+        chunks = [
+            {
+                "text": doc,
+                "page_title": meta.get("page_title", ""),
+                "section": meta.get("section", ""),
+                "url": meta.get("url", ""),
+                "score": 1.0,
+            }
+            for doc, meta in zip(result["documents"], result["metadatas"])
+            if value in doc
+            and not _is_blocked(meta.get("page_title", ""))
+        ]
+
+    # Sort by page title for consistent ordering
+    chunks.sort(key=lambda c: c["page_title"])
+
+    # Condense results to fit within token budget.
+    # Verbose mode (comparisons) keeps more stats for deeper analysis.
+    keywords = _CONDENSATION_VERBOSE if verbose else _CONDENSATION_LIGHT
+    char_budget = MAX_COMPARATIVE_CHARS if verbose else MAX_ENUM_CHARS
+
+    condensed: list[dict] = []
+    total_chars = 0
+    for c in chunks:
+        lines = c["text"].split("\n")
+        kept = [lines[0]] if lines else []
+        for line in lines[1:]:
+            if any(kw in line for kw in keywords):
+                kept.append(line)
+        entry_text = "\n".join(kept)
+        if total_chars + len(entry_text) > char_budget:
+            logger.info("Category hit %d char budget at %d/%d entries", char_budget, len(condensed), len(chunks))
+            break
+        condensed.append({**c, "text": entry_text})
+        total_chars += len(entry_text)
+
+    logger.info("Category: %d/%d entries, %d chars (verbose=%s) for %r", len(condensed), len(chunks), total_chars, verbose, strategy)
+    return condensed
+
 
 # Keywords that signal the user wants a comparison or recommendation
 COMPARATIVE_KEYWORDS = {
@@ -40,9 +189,15 @@ _PREFIX_BLOCKED: tuple[str, ...] = (
 )
 
 
+# Version/changelog pages — broad vocabulary pollutes almost every query
+_VERSION_PAGE_RE = re.compile(r"^\d+\.\d+")
+
+
 def _is_blocked(page_title: str) -> bool:
     """Return True if a page title is on the blocklist."""
     if page_title in _EXACT_BLOCKED:
+        return True
+    if _VERSION_PAGE_RE.match(page_title):
         return True
     return any(
         page_title == p or page_title.startswith(p + "/")
@@ -56,6 +211,37 @@ _QUESTION_STARTERS = {
     "has", "have", "had", "was", "were", "should", "would", "could",
     "tell", "explain", "describe", "list", "show",
 }
+
+# Player vocabulary → wiki vocabulary mappings.
+# Applied to queries before embedding to bridge common terminology gaps.
+_SYNONYM_MAP: dict[str, str] = {
+    "demon": "daemon",
+    "demons": "daemons",
+}
+
+
+def _normalize_query(question: str) -> str:
+    """Replace common player terms with wiki-canonical vocabulary.
+
+    Preserves original casing for unmapped words. For mapped words,
+    matches the capitalisation of the original (e.g. "Demon" → "Daemon").
+    Handles trailing punctuation (e.g. "Demon?" → "Daemon?").
+    """
+    words = question.split()
+    result: list[str] = []
+    for w in words:
+        # Strip trailing punctuation for lookup, reattach after
+        core = w.rstrip("?!.,;:")
+        suffix = w[len(core):]
+        replacement = _SYNONYM_MAP.get(core.lower())
+        if replacement is None:
+            result.append(w)
+        elif core[0].isupper():
+            result.append(replacement.capitalize() + suffix)
+        else:
+            result.append(replacement + suffix)
+    return " ".join(result)
+
 
 _embedder: SentenceTransformer | None = None
 
@@ -118,14 +304,41 @@ def _query_by_page_title(collection, entity: str) -> list[dict]:
     return []
 
 
+_MAX_TITLE_BOOSTS = 3  # cap to avoid flooding variants on long queries
+
+# Cache of all page title prefixes (e.g. "Races/", "Mobs/", "Abilities/Magics/")
+# Built lazily on first use from the ChromaDB index.
+_title_prefixes: list[str] | None = None
+
+
+def _get_title_prefixes(collection) -> list[str]:
+    """Return all page title prefixes sorted longest-first for greedy matching."""
+    global _title_prefixes
+    if _title_prefixes is not None:
+        return _title_prefixes
+    result = collection.get(include=["metadatas"])
+    prefixes: set[str] = set()
+    for meta in result["metadatas"]:
+        title = meta.get("page_title", "")
+        if "/" in title:
+            prefixes.add(title.rsplit("/", 1)[0] + "/")
+    # Sort longest-first so "Items/Schematics/" matches before "Items/"
+    _title_prefixes = sorted(prefixes, key=len, reverse=True)
+    logger.debug("Loaded %d page title prefixes", len(_title_prefixes))
+    return _title_prefixes
+
+
 def _inject_page_title_variant(
     collection, question: str, variants: list[str],
 ) -> None:
-    """If words in the question match a page title, add it as a search variant.
+    """If words in the question match page titles, add them as search variants.
 
     Prevents common terms ("cooldown", "damage") from drowning entity names
     ("creator", "predator") in the embedding. Checks 1-, 2-, and 3-word windows
     from the question against ChromaDB page titles.
+
+    For multi-entity queries ("hero as a giant?"), injects ALL matching page
+    titles (up to _MAX_TITLE_BOOSTS) so both entities get retrieval coverage.
     """
     words = question.rstrip("?").strip().split()
     # Skip question-starter words for candidate generation
@@ -133,19 +346,33 @@ def _inject_page_title_variant(
     if not content_words:
         return
 
-    # Build candidate phrases: single words, bigrams, trigrams
+    # Build candidate phrases: trigrams first (more specific), then bigrams, then unigrams
     candidates: list[str] = []
-    for size in (1, 2, 3):
+    for size in (3, 2, 1):
         for i in range(len(content_words) - size + 1):
             phrase = " ".join(content_words[i:i + size])
             if len(phrase) >= 3:  # skip very short candidates
                 candidates.append(phrase)
 
+    boosts = 0
+    matched_words: set[str] = set()  # track which words already matched to avoid subset dupes
     for phrase in candidates:
+        if boosts >= _MAX_TITLE_BOOSTS:
+            break
         if phrase in variants:
             continue
-        # Try exact page title match (case-insensitive via title-case)
-        for form in dict.fromkeys([phrase, phrase.title()]):
+        # Skip if all words in this phrase were already matched by a longer phrase
+        phrase_words = set(phrase.lower().split())
+        if phrase_words <= matched_words:
+            continue
+        # Try exact page title match, then every known prefix (Races/X, Mobs/X, etc.)
+        titled = phrase.title()
+        forms = [phrase, titled]
+        for prefix in _get_title_prefixes(collection):
+            forms.append(f"{prefix}{titled}")
+        # Deduplicate while preserving order
+        forms = list(dict.fromkeys(forms))
+        for form in forms:
             if _is_blocked(form):
                 continue
             result = collection.get(
@@ -156,7 +383,9 @@ def _inject_page_title_variant(
             if result["ids"]:
                 logger.debug("Page title boost: %r matches page %r", phrase, form)
                 variants.append(form)
-                return  # one boost is enough
+                matched_words.update(phrase_words)
+                boosts += 1
+                break
 
 
 def query(question: str) -> list[dict]:
@@ -168,6 +397,22 @@ def query(question: str) -> list[dict]:
     Each returned dict has keys: text, page_title, section, url, score.
     """
     collection = get_collection()
+
+    # Normalize player vocabulary before any processing (TEN-166)
+    question = _normalize_query(question)
+
+    # Fast path: enumeration queries ("list all races?", "what unique skills are there?")
+    # Also triggers for comparative queries that target a known category
+    # ("what is the strongest race?" = comparative + races category)
+    enum_strategy = _detect_enumeration(question)
+    comparative = is_comparative(question)
+    if not enum_strategy and comparative:
+        enum_strategy = _detect_category(question)
+    if enum_strategy:
+        enum_chunks = _query_category(collection, enum_strategy, verbose=comparative)
+        if enum_chunks:
+            return enum_chunks
+        logger.debug("Category %r returned no results, falling back to semantic search", enum_strategy)
 
     # Fast path: bare entity lookup (e.g. "Predator?", "Great Sage?")
     entity = _bare_entity_name(question)
