@@ -118,10 +118,12 @@ def fetch_updated_pages(since: str) -> list[dict]:
     site = connect()
 
     logger.info("Querying recentchanges since %s", since)
-    # recentchanges lists newest→oldest by default; rcend is the cut-off (oldest point)
+    # Query each type separately and merge — passing multiple types as a list
+    # to mwclient reduces results instead of expanding them (API/library bug).
     changed_titles: set[str] = set()
-    for change in site.recentchanges(end=since, dir="older", prop=["title"], type=["edit", "new", "log"]):
-        changed_titles.add(change["title"])
+    for rc_type in ("edit", "new", "log"):
+        for change in site.recentchanges(end=since, dir="older", prop=["title"], type=[rc_type]):
+            changed_titles.add(change["title"])
 
     logger.info("recentchanges returned %d title(s): %s", len(changed_titles), ", ".join(sorted(changed_titles)) or "(none)")
     if not changed_titles:
