@@ -145,3 +145,214 @@ class TestEntityFallback:
         results = query("Shadow Striker?")
         page_titles = [r["page_title"] for r in results]
         assert any("Shadow Striker" in t for t in page_titles)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Enumeration detection (unit tests, no ChromaDB needed)
+# ---------------------------------------------------------------------------
+
+class TestEnumerationDetection:
+    """TEN-64: Detect enumeration intent and map to category strategies."""
+
+    def test_list_all_races(self):
+        from rag.retriever import _detect_enumeration
+        assert _detect_enumeration("list all races?") == "prefix:Races"
+
+    def test_list_all_unique_skills(self):
+        from rag.retriever import _detect_enumeration
+        assert _detect_enumeration("list all unique skills?") == "content:Unique Skill"
+
+    def test_what_extra_skills_exist(self):
+        from rag.retriever import _detect_enumeration
+        assert _detect_enumeration("what extra skills are there?") == "content:Extra Skill"
+
+    def test_show_every_common_skill(self):
+        from rag.retriever import _detect_enumeration
+        assert _detect_enumeration("show every common skill?") == "content:Common Skill"
+
+    def test_list_all_magics(self):
+        from rag.retriever import _detect_enumeration
+        assert _detect_enumeration("list all magics?") == "prefix:Abilities/Magics"
+
+    def test_how_many_mobs(self):
+        from rag.retriever import _detect_enumeration
+        assert _detect_enumeration("how many mobs are there?") == "prefix:Mobs"
+
+    def test_list_all_battlewills(self):
+        from rag.retriever import _detect_enumeration
+        assert _detect_enumeration("list all battlewill skills?") == "content:Battlewill"
+
+    def test_normal_query_not_detected(self):
+        from rag.retriever import _detect_enumeration
+        assert _detect_enumeration("What does Predator do?") is None
+
+    def test_bare_entity_not_detected(self):
+        from rag.retriever import _detect_enumeration
+        assert _detect_enumeration("Predator?") is None
+
+    def test_comparative_not_detected_as_enumeration(self):
+        from rag.retriever import _detect_enumeration
+        assert _detect_enumeration("What is the best race?") is None
+
+
+class TestCategoryDetection:
+    """_detect_category maps category terms to retrieval strategies."""
+
+    def test_races(self):
+        from rag.retriever import _detect_category
+        assert _detect_category("strongest race?") == "prefix:Races"
+
+    def test_unique_skills(self):
+        from rag.retriever import _detect_category
+        assert _detect_category("best unique skill?") == "content:Unique Skill"
+
+    def test_broad_excluded_in_comparative(self):
+        from rag.retriever import _detect_category
+        assert _detect_category("best item?", exclude_broad=True) is None
+        assert _detect_category("strongest mob?", exclude_broad=True) is None
+        assert _detect_category("best block?", exclude_broad=True) is None
+
+    def test_broad_allowed_without_exclusion(self):
+        from rag.retriever import _detect_category
+        assert _detect_category("best item?") == "prefix:Items"
+        assert _detect_category("strongest mob?") == "prefix:Mobs"
+
+    def test_no_category(self):
+        from rag.retriever import _detect_category
+        assert _detect_category("how do I play?") is None
+
+
+class TestComparativeClassifier:
+    """TEN-25: is_comparative detects comparison/recommendation intent."""
+
+    def test_best_triggers(self):
+        from rag.retriever import is_comparative
+        assert is_comparative("What is the best race?") is True
+
+    def test_strongest_triggers(self):
+        from rag.retriever import is_comparative
+        assert is_comparative("What is the strongest skill?") is True
+
+    def test_compare_triggers(self):
+        from rag.retriever import is_comparative
+        assert is_comparative("Compare slime vs goblin?") is True
+
+    def test_which_triggers(self):
+        from rag.retriever import is_comparative
+        assert is_comparative("Which race is better?") is True
+
+    def test_worst_triggers(self):
+        from rag.retriever import is_comparative
+        assert is_comparative("What is the worst skill?") is True
+
+    def test_normal_question_not_comparative(self):
+        from rag.retriever import is_comparative
+        assert is_comparative("What does Predator do?") is False
+
+    def test_bare_entity_not_comparative(self):
+        from rag.retriever import is_comparative
+        assert is_comparative("Predator?") is False
+
+
+class TestSynonymNormalization:
+    """TEN-166: _normalize_query maps player terms to wiki vocabulary."""
+
+    def test_demon_to_daemon(self):
+        from rag.retriever import _normalize_query
+        assert _normalize_query("lesser demon?") == "lesser daemon?"
+
+    def test_preserves_capitalization(self):
+        from rag.retriever import _normalize_query
+        assert _normalize_query("Lesser Demon?") == "Lesser Daemon?"
+
+    def test_plural_form(self):
+        from rag.retriever import _normalize_query
+        assert _normalize_query("how to summon demons?") == "how to summon daemons?"
+
+    def test_no_change_for_unmapped(self):
+        from rag.retriever import _normalize_query
+        assert _normalize_query("Predator?") == "Predator?"
+
+    def test_handles_punctuation(self):
+        from rag.retriever import _normalize_query
+        assert _normalize_query("demon!") == "daemon!"
+
+
+class TestVersionBlocklist:
+    """TEN-165: Version/changelog pages are blocked."""
+
+    def test_version_page_blocked(self):
+        from rag.retriever import _is_blocked
+        assert _is_blocked("1.19.2 1.0.0.0") is True
+        assert _is_blocked("1.19.2 1.0.0.1") is True
+
+    def test_normal_page_not_blocked(self):
+        from rag.retriever import _is_blocked
+        assert _is_blocked("Predator") is False
+        assert _is_blocked("Races/Human") is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Enumeration retrieval (requires ChromaDB)
+# ---------------------------------------------------------------------------
+
+@requires_index
+class TestEnumerationRetrieval:
+    """TEN-64/TEN-50: Category retrieval returns complete lists."""
+
+    def test_list_all_races_returns_many(self):
+        from rag.retriever import query
+        results = query("list all races?")
+        assert len(results) >= 50, f"Expected 50+ races, got {len(results)}"
+        assert all(r["page_title"].startswith("Races/") for r in results)
+
+    def test_list_all_unique_skills_returns_many(self):
+        from rag.retriever import query
+        results = query("list all unique skills?")
+        assert len(results) >= 40, f"Expected 40+ unique skills, got {len(results)}"
+
+    def test_list_all_magics_returns_many(self):
+        from rag.retriever import query
+        results = query("list all magics?")
+        assert len(results) >= 20, f"Expected 20+ magics, got {len(results)}"
+
+    def test_enumeration_fits_token_budget(self):
+        """All enumeration results should fit within MAX_ENUM_CHARS."""
+        from rag.retriever import query, MAX_ENUM_CHARS
+        results = query("list all races?")
+        total = sum(len(r["text"]) for r in results)
+        assert total <= MAX_ENUM_CHARS, f"Enumeration {total} chars exceeds {MAX_ENUM_CHARS}"
+
+    def test_normal_query_not_affected_by_enumeration(self):
+        from rag.retriever import query
+        results = query("Predator?")
+        assert all(r["page_title"] == "Predator" for r in results)
+
+
+@requires_index
+class TestComparativeRetrieval:
+    """TEN-25: Comparative queries about categories get full data with verbose stats."""
+
+    def test_strongest_race_gets_all_races(self):
+        from rag.retriever import query
+        results = query("what is the strongest race?")
+        assert len(results) >= 40, f"Expected 40+ races for comparison, got {len(results)}"
+
+    def test_verbose_includes_attack_stats(self):
+        from rag.retriever import query
+        results = query("what is the strongest race?")
+        all_text = " ".join(r["text"] for r in results)
+        assert "Attack DMG:" in all_text, "Verbose mode should include Attack DMG"
+        assert "Intrinsics:" in all_text or "Previous:" in all_text, \
+            "Verbose mode should include Intrinsics or evolution chain"
+
+    def test_best_unique_skill_gets_all_skills(self):
+        from rag.retriever import query
+        results = query("what is the best unique skill?")
+        assert len(results) >= 40, f"Expected 40+ skills for comparison, got {len(results)}"
+
+    def test_broad_category_comparative_uses_semantic(self):
+        """'best item?' should NOT dump all items — falls through to semantic search."""
+        from rag.retriever import query
+        results = query("what is the best item?")
+        assert len(results) <= 10, f"Broad category should use semantic K=10, got {len(results)}"
