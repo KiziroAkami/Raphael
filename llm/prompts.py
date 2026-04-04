@@ -53,17 +53,34 @@ def _sanitize_chunk(text: str) -> str:
     return _CHUNK_INJECTION_RE.sub("[redacted]", text)
 
 
-def build_rag_prompt(question: str, chunks: list[dict]) -> str:
-    """Construct the user-turn message containing context + question."""
+def build_rag_prompt(
+    question: str,
+    chunks: list[dict],
+    history: list[tuple[str, str]] | None = None,
+) -> str:
+    """Construct the user-turn message containing context + question.
+
+    If history is provided, prepends recent Q&A pairs so the LLM can
+    resolve pronouns and follow-up references.
+    """
+    parts: list[str] = []
+
+    # Conversation history (if any)
+    if history:
+        lines = ["Recent conversation with this user:"]
+        for q, a in history:
+            lines.append(f"Q: {_sanitize_chunk(q)}")
+            lines.append(f"A: {_sanitize_chunk(a)}")
+        parts.append("\n".join(lines))
+
+    # Wiki context
     context_parts = []
     for chunk in chunks:
         header = f"[{chunk['page_title']} — {chunk['section']}]"
         context_parts.append(f"{header}\n{_sanitize_chunk(chunk['text'])}")
+    parts.append(f"Wiki context:\n\n{'\n\n---\n\n'.join(context_parts)}")
 
-    context = "\n\n---\n\n".join(context_parts)
+    # Question
+    parts.append(f"Question: {_sanitize_chunk(question)}")
 
-    return (
-        f"Wiki context:\n\n{context}\n\n"
-        f"---\n\n"
-        f"Question: {_sanitize_chunk(question)}"
-    )
+    return "\n\n---\n\n".join(parts)

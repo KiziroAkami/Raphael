@@ -125,7 +125,11 @@ def expand_query(question: str) -> list[str]:
         return []
 
 
-def answer(question: str, chunks: list[dict]) -> tuple[str, str]:
+def answer(
+    question: str,
+    chunks: list[dict],
+    history: list[tuple[str, str]] | None = None,
+) -> tuple[str, str]:
     """Generate a Raphael-persona answer grounded in the retrieved chunks.
 
     Walks MODEL_CHAIN in order, falling back on RateLimitError.
@@ -134,7 +138,7 @@ def answer(question: str, chunks: list[dict]) -> tuple[str, str]:
     if not chunks:
         return _INSUFFICIENT_DATA, "none"
 
-    user_message = build_rag_prompt(question, chunks)
+    user_message = build_rag_prompt(question, chunks, history=history)
 
     for i, model in enumerate(MODEL_CHAIN):
         try:

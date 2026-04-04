@@ -70,6 +70,46 @@ COOLDOWN_SECONDS = 6
 _MAX_COOLDOWN_ENTRIES = 100
 _last_call: dict[int, float] = {}  # user_id → monotonic timestamp
 
+# Per-user conversation memory for follow-up questions (TEN-114)
+_MEMORY_MAX_PAIRS = 3          # Q&A pairs per user
+_MEMORY_EXPIRY = 600.0         # 10 minutes
+_MEMORY_MAX_USERS = 500
+_MEMORY_SUMMARY_LEN = 120     # chars of response to keep
+_conversation_memory: dict[int, list[tuple[str, str, float]]] = {}
+# user_id → [(question, answer_summary, monotonic_timestamp), ...]
+
+
+def _get_memory(user_id: int) -> list[tuple[str, str]]:
+    """Return unexpired (question, answer_summary) pairs for a user."""
+    entries = _conversation_memory.get(user_id, [])
+    now = time.monotonic()
+    valid = [(q, a) for q, a, ts in entries if now - ts < _MEMORY_EXPIRY]
+    return valid
+
+
+def _store_memory(user_id: int, question: str, response: str) -> None:
+    """Append a Q&A pair to the user's memory, evicting old entries."""
+    now = time.monotonic()
+    summary = response[:_MEMORY_SUMMARY_LEN]
+
+    # Get or create, filter expired
+    entries = [
+        (q, a, ts) for q, a, ts in _conversation_memory.get(user_id, [])
+        if now - ts < _MEMORY_EXPIRY
+    ]
+    entries.append((question, summary, now))
+
+    # Keep only last N pairs
+    entries = entries[-_MEMORY_MAX_PAIRS:]
+
+    # LRU: pop and reinsert for ordering
+    _conversation_memory.pop(user_id, None)
+    _conversation_memory[user_id] = entries
+
+    # Evict oldest users if over cap
+    while len(_conversation_memory) > _MEMORY_MAX_USERS:
+        _conversation_memory.pop(next(iter(_conversation_memory)))
+
 _ERROR_RESPONSE = (
     "My calculations encountered an anomaly. "
     "I shall attempt to answer when systems stabilise."
@@ -133,13 +173,17 @@ def setup_events(client: discord.Client) -> None:
     async def _handle_question(
         message: discord.Message, content: str, raw_content: str,
     ) -> None:
-        """Run RAG retrieval → LLM → log → send reply."""
+        """Run RAG retrieval → LLM (with conversation memory) → log → send reply."""
         t_start = time.monotonic()
         try:
             await message.add_reaction("⏳")
             loop = asyncio.get_running_loop()
+            history = _get_memory(message.author.id)
             chunks = await loop.run_in_executor(None, retrieve, content)
-            response, model_used = await loop.run_in_executor(None, answer, content, chunks)
+            response, model_used = await loop.run_in_executor(
+                None, answer, content, chunks, history or None,
+            )
+            _store_memory(message.author.id, content, response)
             await message.remove_reaction("⏳", client.user)
 
             latency_ms = int((time.monotonic() - t_start) * 1000)
