@@ -60,10 +60,21 @@ _CATEGORY_MAP: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
-def _detect_category(question: str) -> str | None:
+# Categories too broad for the comparative path — would dump hundreds of entries
+# when a user asks "which item is best?" or "strongest mob?"
+# These still work for explicit enumeration ("list all items?").
+_BROAD_CATEGORIES: frozenset[str] = frozenset({
+    "prefix:Items", "prefix:Items/Schematics", "prefix:Blocks",
+    "prefix:Mobs", "prefix:Structures", "content:Skill",
+})
+
+
+def _detect_category(question: str, exclude_broad: bool = False) -> str | None:
     """Return the retrieval strategy if the question mentions a known category, or None."""
     for pattern, strategy in _CATEGORY_MAP:
         if pattern.search(question):
+            if exclude_broad and strategy in _BROAD_CATEGORIES:
+                continue
             return strategy
     return None
 
@@ -79,65 +90,53 @@ def _detect_enumeration(question: str) -> str | None:
     return _detect_category(question)
 
 
-def _query_category(collection, strategy: str, verbose: bool = False) -> list[dict]:
-    """Fetch all summary chunks for a category using metadata queries.
+def _fetch_category_chunks(collection, strategy: str) -> list[dict]:
+    """Fetch all summary chunks for a category, sorted by page title.
 
-    For prefix strategies: fetches all pages whose title starts with the prefix.
-    For content strategies: fetches all summary chunks containing the marker text.
-
-    verbose=False (enumeration): light condensation — name + key identifiers only.
-    verbose=True  (comparison):  rich condensation — full stats, intrinsics, evolution.
+    prefix strategies: all pages whose title starts with the given path.
+    content strategies: all summary chunks whose text contains the marker.
     """
     kind, value = strategy.split(":", 1)
 
     if kind == "prefix":
-        # Get all summary chunks for pages under this prefix
         result = collection.get(
             where={
                 "$and": [
                     {"chunk_type": {"$eq": "summary"}},
-                    {"page_title": {"$ne": value}},  # exclude the overview page itself
+                    {"page_title": {"$ne": value}},
                 ]
             },
             include=["documents", "metadatas"],
         )
-        # Filter to matching prefix (ChromaDB doesn't support startswith)
         chunks = [
-            {
-                "text": doc,
-                "page_title": meta.get("page_title", ""),
-                "section": meta.get("section", ""),
-                "url": meta.get("url", ""),
-                "score": 1.0,
-            }
+            {"text": doc, "page_title": meta.get("page_title", ""),
+             "section": meta.get("section", ""), "url": meta.get("url", ""), "score": 1.0}
             for doc, meta in zip(result["documents"], result["metadatas"])
             if meta.get("page_title", "").startswith(value + "/")
             and not _is_blocked(meta.get("page_title", ""))
         ]
     else:
-        # Content-based: get all summary chunks containing the marker
         result = collection.get(
             where={"chunk_type": {"$eq": "summary"}},
             include=["documents", "metadatas"],
         )
         chunks = [
-            {
-                "text": doc,
-                "page_title": meta.get("page_title", ""),
-                "section": meta.get("section", ""),
-                "url": meta.get("url", ""),
-                "score": 1.0,
-            }
+            {"text": doc, "page_title": meta.get("page_title", ""),
+             "section": meta.get("section", ""), "url": meta.get("url", ""), "score": 1.0}
             for doc, meta in zip(result["documents"], result["metadatas"])
-            if value in doc
-            and not _is_blocked(meta.get("page_title", ""))
+            if value in doc and not _is_blocked(meta.get("page_title", ""))
         ]
 
-    # Sort by page title for consistent ordering
     chunks.sort(key=lambda c: c["page_title"])
+    return chunks
 
-    # Condense results to fit within token budget.
-    # Verbose mode (comparisons) keeps more stats for deeper analysis.
+
+def _condense_chunks(chunks: list[dict], verbose: bool = False) -> list[dict]:
+    """Condense category chunks to fit within token budget.
+
+    verbose=False: light — name + key identifiers (for enumeration).
+    verbose=True:  rich — full stats, intrinsics, evolution (for comparison).
+    """
     keywords = _CONDENSATION_VERBOSE if verbose else _CONDENSATION_LIGHT
     char_budget = MAX_COMPARATIVE_CHARS if verbose else MAX_ENUM_CHARS
 
@@ -156,8 +155,14 @@ def _query_category(collection, strategy: str, verbose: bool = False) -> list[di
         condensed.append({**c, "text": entry_text})
         total_chars += len(entry_text)
 
-    logger.info("Category: %d/%d entries, %d chars (verbose=%s) for %r", len(condensed), len(chunks), total_chars, verbose, strategy)
+    logger.info("Category: %d/%d entries, %d chars (verbose=%s)", len(condensed), len(chunks), total_chars, verbose)
     return condensed
+
+
+def _query_category(collection, strategy: str, verbose: bool = False) -> list[dict]:
+    """Fetch and condense all summary chunks for a category."""
+    chunks = _fetch_category_chunks(collection, strategy)
+    return _condense_chunks(chunks, verbose=verbose)
 
 
 # Keywords that signal the user wants a comparison or recommendation
@@ -388,63 +393,13 @@ def _inject_page_title_variant(
                 break
 
 
-def query(question: str) -> list[dict]:
-    """Embed the question, search ChromaDB, and return the most relevant chunks.
+def _semantic_search(collection, variants: list[str], k: int) -> list[dict]:
+    """Run each query variant through ChromaDB and return top-K merged results.
 
-    For bare entity queries (e.g. "Predator?"), attempts an exact page_title lookup
-    before falling back to semantic search.
-
-    Each returned dict has keys: text, page_title, section, url, score.
+    Deduplicates by chunk text, keeping the highest score per unique chunk.
     """
-    collection = get_collection()
-
-    # Normalize player vocabulary before any processing (TEN-166)
-    question = _normalize_query(question)
-
-    # Fast path: enumeration queries ("list all races?", "what unique skills are there?")
-    # Also triggers for comparative queries that target a known category
-    # ("what is the strongest race?" = comparative + races category)
-    enum_strategy = _detect_enumeration(question)
-    comparative = is_comparative(question)
-    if not enum_strategy and comparative:
-        enum_strategy = _detect_category(question)
-    if enum_strategy:
-        enum_chunks = _query_category(collection, enum_strategy, verbose=comparative)
-        if enum_chunks:
-            return enum_chunks
-        logger.debug("Category %r returned no results, falling back to semantic search", enum_strategy)
-
-    # Fast path: bare entity lookup (e.g. "Predator?", "Great Sage?")
-    entity = _bare_entity_name(question)
-    if entity:
-        page_chunks = _query_by_page_title(collection, entity)
-        if page_chunks:
-            return page_chunks
-        logger.debug("Bare entity %r not found by page_title, falling back to semantic search", entity)
-
     embedder = _get_embedder()
-    k = K_COMPARATIVE if is_comparative(question) else K_FACTUAL
-
-    # Expand the query to cover vocabulary mismatches (e.g. "tame" → "charm/subjugate").
-    # Falls back to the original query only if expansion fails.
-    variants = [question] + expand_query(question)
-
-    # TEN-111: If bare entity lookup failed, inject the entity name as a search
-    # variant so semantic search can still find the right page.
-    if entity and entity not in variants:
-        variants.append(entity)
-
-    # TEN-113: If any word(s) in the query match a page title, inject that title
-    # as a variant to prevent common terms from drowning entity names.
-    # Runs for all queries that reach semantic search — including bare entities
-    # whose exact page_title lookup failed (e.g. "creator cooldown?").
-    _inject_page_title_variant(collection, question, variants)
-
-    logger.debug("Query variants (%d): %s", len(variants), variants)
-
-    # Run each variant through ChromaDB and merge results, keeping the highest
-    # score per unique chunk (deduplication by chunk text).
-    seen: dict[str, dict] = {}  # text → best chunk dict so far
+    seen: dict[str, dict] = {}
 
     for variant in variants:
         anchored = QUERY_PREFIX + variant
@@ -461,13 +416,12 @@ def query(question: str) -> list[dict]:
             results["metadatas"][0],
             results["distances"][0],
         ):
-            score = 1.0 - (dist / 2.0)  # cosine distance → similarity
+            score = 1.0 - (dist / 2.0)
             if score < RELEVANCE_THRESHOLD:
                 continue
             page_title = meta.get("page_title", "")
             if _is_blocked(page_title):
                 continue
-            # Keep the entry only if it improves on what we already have
             if text not in seen or score > seen[text]["score"]:
                 seen[text] = {
                     "text": text,
@@ -477,5 +431,41 @@ def query(question: str) -> list[dict]:
                     "score": round(score, 3),
                 }
 
-    # Return top-K sorted by score descending
     return sorted(seen.values(), key=lambda c: c["score"], reverse=True)[:k]
+
+
+def query(question: str) -> list[dict]:
+    """Embed the question, search ChromaDB, and return the most relevant chunks.
+
+    Routing order: enumeration/comparative → bare entity → semantic search.
+    Each returned dict has keys: text, page_title, section, url, score.
+    """
+    collection = get_collection()
+    question = _normalize_query(question)
+
+    # Fast path: enumeration or comparative + category
+    enum_strategy = _detect_enumeration(question)
+    comparative = is_comparative(question)
+    if not enum_strategy and comparative:
+        enum_strategy = _detect_category(question, exclude_broad=True)
+    if enum_strategy:
+        enum_chunks = _query_category(collection, enum_strategy, verbose=comparative)
+        if enum_chunks:
+            return enum_chunks
+
+    # Fast path: bare entity lookup (e.g. "Predator?", "Great Sage?")
+    entity = _bare_entity_name(question)
+    if entity:
+        page_chunks = _query_by_page_title(collection, entity)
+        if page_chunks:
+            return page_chunks
+
+    # Semantic search with query expansion and page title boosting
+    k = K_COMPARATIVE if comparative else K_FACTUAL
+    variants = [question] + expand_query(question)
+    if entity and entity not in variants:
+        variants.append(entity)
+    _inject_page_title_variant(collection, question, variants)
+    logger.debug("Query variants (%d): %s", len(variants), variants)
+
+    return _semantic_search(collection, variants, k)
