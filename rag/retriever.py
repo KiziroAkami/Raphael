@@ -46,7 +46,7 @@ _CATEGORY_MAP: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bcommon\s+skills?\b", re.IGNORECASE), "content:Common Skill"),
     (re.compile(r"\bintrinsic\s+skills?\b", re.IGNORECASE), "content:Intrinsic Skill"),
     (re.compile(r"\bresistance\s+skills?\b", re.IGNORECASE), "content:Resistance Skill"),
-    (re.compile(r"\bbattlewills?\b", re.IGNORECASE), "content:Battlewill"),
+    (re.compile(r"\bbattlewills?\b", re.IGNORECASE), "prefix:Abilities/Battlewills"),
     # Engraving sub-categories (sections within the Engravings page)
     (re.compile(r"\bblessings?\b", re.IGNORECASE), "allcontent:Blessing"),
     (re.compile(r"\bcurses?\b", re.IGNORECASE), "allcontent:Curse"),

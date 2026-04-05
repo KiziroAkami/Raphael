@@ -36,6 +36,17 @@ _INJECTION_RE = re.compile(
 # Discord mention formats: <@id>, <@!id>, <@&id>, <#id>
 _DISCORD_MENTION_RE = re.compile(r"<[@#][!&]?\d+>")
 
+# Mid-message language override — "in turkish", "in mandarin", etc. anywhere in the query.
+# Stripped to prevent the LLM from responding in a non-English language (rule #8).
+_LANGUAGE_OVERRIDE_RE = re.compile(
+    r"\s+in\s+(?:turkish|chinese|mandarin|korean|japanese|spanish|french|german|"
+    r"portuguese|russian|arabic|hindi|italian|dutch|polish|swedish|thai|"
+    r"indonesian|vietnamese|czech|greek|hebrew|finnish|danish|norwegian|"
+    r"malay|tagalog|swahili|romanian|hungarian|ukrainian|bengali|"
+    r"cantonese|persian|farsi)\b",
+    re.IGNORECASE,
+)
+
 # Minimum chars (excluding trailing ?) after prefix stripping.
 # Set to 2 to allow short entity lookups like "EP?" or "Orc?".
 _MIN_CLEANED_LEN = 2
@@ -49,6 +60,7 @@ def _clean_query(raw: str) -> str | None:
     cleaned = _DISCORD_MENTION_RE.sub("", raw)
     cleaned = re.sub(r" {2,}", " ", cleaned).strip()
     cleaned = _INSTRUCTION_PREFIX.sub("", cleaned).strip()
+    cleaned = _LANGUAGE_OVERRIDE_RE.sub("", cleaned).strip()
     body = cleaned.rstrip("?").strip()
 
     if len(body) < _MIN_CLEANED_LEN:

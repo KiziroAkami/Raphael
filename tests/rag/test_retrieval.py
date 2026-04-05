@@ -180,7 +180,7 @@ class TestEnumerationDetection:
 
     def test_list_all_battlewills(self):
         from rag.retriever import _detect_enumeration
-        assert _detect_enumeration("list all battlewill skills?") == "content:Battlewill"
+        assert _detect_enumeration("list all battlewill skills?") == "prefix:Abilities/Battlewills"
 
     def test_normal_query_not_detected(self):
         from rag.retriever import _detect_enumeration
