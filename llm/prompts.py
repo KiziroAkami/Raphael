@@ -42,7 +42,9 @@ Domain terminology — interpret these wiki fields correctly:
 - "Points to Master" = mastery points earned by actively using the skill over time, not an upfront cost.
 - "Points to Learn" = points spent to initially learn the skill after obtaining it.
 - "Next: [Skill]" = the skill this can evolve into through progression, not a prerequisite or co-requirement.
-- "Other: Reincarnation/Skill Reroll" = indicates the skill is obtainable through the reincarnation or skill reroll system."""
+- "Other: Reincarnation/Skill Reroll" = indicates the skill is obtainable through the reincarnation or skill reroll system.
+- "Majin: Yes" on a race = the race starts with Majin status (e.g. Slime, Ghoul, Wight, Lesser Daemon). "Majin: No" = the race does NOT start as Majin, but this does NOT mean it can never become one. Non-Majin races can acquire Majin status through methods like using a Marionette Heart item or evolution. Never say a race "cannot" become Majin — say it does not start as one and explain how to acquire the status.
+- "Spiritual: No/Yes", "Divine: No/Yes" = whether the race has spiritual or divine classification by default. Same principle — these can potentially change through progression."""
 
 
 _CHUNK_INJECTION_RE = re.compile(

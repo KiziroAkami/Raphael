@@ -1,5 +1,6 @@
 import logging
 import re
+import threading
 
 from sentence_transformers import SentenceTransformer
 from rag.indexer import get_collection, EMBED_MODEL
@@ -46,6 +47,10 @@ _CATEGORY_MAP: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bintrinsic\s+skills?\b", re.IGNORECASE), "content:Intrinsic Skill"),
     (re.compile(r"\bresistance\s+skills?\b", re.IGNORECASE), "content:Resistance Skill"),
     (re.compile(r"\bbattlewills?\b", re.IGNORECASE), "content:Battlewill"),
+    # Engraving sub-categories (sections within the Engravings page)
+    (re.compile(r"\bblessings?\b", re.IGNORECASE), "allcontent:Blessing"),
+    (re.compile(r"\bcurses?\b", re.IGNORECASE), "allcontent:Curse"),
+    (re.compile(r"\bengravings?\b", re.IGNORECASE), "allcontent:Engravings —"),
     # Prefix-based categories
     (re.compile(r"\braces?\b", re.IGNORECASE), "prefix:Races"),
     (re.compile(r"\bmobs?\b", re.IGNORECASE), "prefix:Mobs"),
@@ -115,7 +120,19 @@ def _fetch_category_chunks(collection, strategy: str) -> list[dict]:
             if meta.get("page_title", "").startswith(value + "/")
             and not _is_blocked(meta.get("page_title", ""))
         ]
+    elif kind == "allcontent":
+        # Search ALL chunks (not just summaries) for the marker — used for
+        # sub-categories like Blessings/Curses within the Engravings page.
+        result = collection.get(include=["documents", "metadatas"])
+        value_lower = value.lower()
+        chunks = [
+            {"text": doc, "page_title": meta.get("page_title", ""),
+             "section": meta.get("section", ""), "url": meta.get("url", ""), "score": 1.0}
+            for doc, meta in zip(result["documents"], result["metadatas"])
+            if value_lower in doc.lower() and not _is_blocked(meta.get("page_title", ""))
+        ]
     else:
+        # content: search summary chunks only
         result = collection.get(
             where={"chunk_type": {"$eq": "summary"}},
             include=["documents", "metadatas"],
@@ -218,34 +235,38 @@ _QUESTION_STARTERS = {
 }
 
 # Player vocabulary → wiki vocabulary mappings.
-# Applied to queries before embedding to bridge common terminology gaps.
-_SYNONYM_MAP: dict[str, str] = {
-    "demon": "daemon",
-    "demons": "daemons",
+# Only applied when the ENTIRE bare query matches a race-context term.
+# Not applied globally because "Demon" is legitimate in non-race contexts
+# (Demon Essence, Demon Lord Haki, Demon Marionette).
+_RACE_SYNONYM_PHRASES: dict[str, str] = {
+    "lesser demon": "lesser daemon",
+    "greater demon": "greater daemon",
+    "arch demon": "arch daemon",
+    "demon lord": "daemon lord",
+    "devil lord": "devil lord",
+    "demon slime": "demon slime",
 }
 
 
 def _normalize_query(question: str) -> str:
-    """Replace common player terms with wiki-canonical vocabulary.
+    """Replace race-context phrases with wiki-canonical vocabulary.
 
-    Preserves original casing for unmapped words. For mapped words,
-    matches the capitalisation of the original (e.g. "Demon" → "Daemon").
-    Handles trailing punctuation (e.g. "Demon?" → "Daemon?").
+    Only maps known multi-word race phrases (e.g. "lesser demon" → "lesser daemon").
+    Leaves single-word "demon" untouched to avoid masking pages like Demon Essence.
     """
-    words = question.split()
-    result: list[str] = []
-    for w in words:
-        # Strip trailing punctuation for lookup, reattach after
-        core = w.rstrip("?!.,;:")
-        suffix = w[len(core):]
-        replacement = _SYNONYM_MAP.get(core.lower())
-        if replacement is None:
-            result.append(w)
-        elif core[0].isupper():
-            result.append(replacement.capitalize() + suffix)
-        else:
-            result.append(replacement + suffix)
-    return " ".join(result)
+    lower = question.lower().rstrip("?!.,;: ")
+    for player_term, wiki_term in _RACE_SYNONYM_PHRASES.items():
+        if player_term in lower:
+            # Case-preserving replacement
+            idx = lower.find(player_term)
+            original = question[idx:idx + len(player_term)]
+            if original[0].isupper():
+                replacement = wiki_term.title()
+            else:
+                replacement = wiki_term
+            question = question[:idx] + replacement + question[idx + len(player_term):]
+            lower = question.lower().rstrip("?!.,;: ")
+    return question
 
 
 _embedder: SentenceTransformer | None = None
@@ -314,6 +335,7 @@ _MAX_TITLE_BOOSTS = 3  # cap to avoid flooding variants on long queries
 # Cache of all page title prefixes (e.g. "Races/", "Mobs/", "Abilities/Magics/")
 # Built lazily on first use from the ChromaDB index.
 _title_prefixes: list[str] | None = None
+_title_prefixes_lock = threading.Lock()
 
 
 def _get_title_prefixes(collection) -> list[str]:
@@ -321,15 +343,17 @@ def _get_title_prefixes(collection) -> list[str]:
     global _title_prefixes
     if _title_prefixes is not None:
         return _title_prefixes
-    result = collection.get(include=["metadatas"])
-    prefixes: set[str] = set()
-    for meta in result["metadatas"]:
-        title = meta.get("page_title", "")
-        if "/" in title:
-            prefixes.add(title.rsplit("/", 1)[0] + "/")
-    # Sort longest-first so "Items/Schematics/" matches before "Items/"
-    _title_prefixes = sorted(prefixes, key=len, reverse=True)
-    logger.debug("Loaded %d page title prefixes", len(_title_prefixes))
+    with _title_prefixes_lock:
+        if _title_prefixes is not None:
+            return _title_prefixes
+        result = collection.get(include=["metadatas"])
+        prefixes: set[str] = set()
+        for meta in result["metadatas"]:
+            title = meta.get("page_title", "")
+            if "/" in title:
+                prefixes.add(title.rsplit("/", 1)[0] + "/")
+        _title_prefixes = sorted(prefixes, key=len, reverse=True)
+        logger.debug("Loaded %d page title prefixes", len(_title_prefixes))
     return _title_prefixes
 
 
@@ -459,6 +483,12 @@ def query(question: str) -> list[dict]:
         page_chunks = _query_by_page_title(collection, entity)
         if page_chunks:
             return page_chunks
+        # Bare entity failed — check if it matches a category (e.g. "blessings?")
+        cat = _detect_category(question)
+        if cat:
+            cat_chunks = _query_category(collection, cat)
+            if cat_chunks:
+                return cat_chunks
 
     # Semantic search with query expansion and page title boosting
     k = K_COMPARATIVE if comparative else K_FACTUAL

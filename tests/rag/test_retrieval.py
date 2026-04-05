@@ -255,9 +255,9 @@ class TestComparativeClassifier:
 
 
 class TestSynonymNormalization:
-    """TEN-166: _normalize_query maps player terms to wiki vocabulary."""
+    """TEN-166: _normalize_query maps race-context phrases to wiki vocabulary."""
 
-    def test_demon_to_daemon(self):
+    def test_lesser_demon_to_daemon(self):
         from rag.retriever import _normalize_query
         assert _normalize_query("lesser demon?") == "lesser daemon?"
 
@@ -265,17 +265,22 @@ class TestSynonymNormalization:
         from rag.retriever import _normalize_query
         assert _normalize_query("Lesser Demon?") == "Lesser Daemon?"
 
-    def test_plural_form(self):
+    def test_arch_demon(self):
         from rag.retriever import _normalize_query
-        assert _normalize_query("how to summon demons?") == "how to summon daemons?"
+        assert _normalize_query("arch demon?") == "arch daemon?"
 
     def test_no_change_for_unmapped(self):
         from rag.retriever import _normalize_query
         assert _normalize_query("Predator?") == "Predator?"
 
-    def test_handles_punctuation(self):
+    def test_single_demon_unchanged(self):
+        """Single 'demon' is NOT mapped — preserves Demon Essence, Demon Lord Haki etc."""
         from rag.retriever import _normalize_query
-        assert _normalize_query("demon!") == "daemon!"
+        assert _normalize_query("Demon Essence?") == "Demon Essence?"
+
+    def test_demon_dominate_unchanged(self):
+        from rag.retriever import _normalize_query
+        assert _normalize_query("demon dominate?") == "demon dominate?"
 
 
 class TestVersionBlocklist:
