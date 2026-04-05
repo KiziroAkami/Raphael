@@ -303,10 +303,17 @@ def _bare_entity_name(question: str) -> str | None:
 def _query_by_page_title(collection, entity: str) -> list[dict]:
     """Return all chunks for a wiki page matching the entity name.
 
-    Tries the entity as-is and then title-cased to handle capitalisation variants.
+    Tries the entity as-is, title-cased, and with all known wiki prefixes
+    (e.g. "Alignment" → "Races/Alignment", "Inspire" → checked under all prefixes).
     Returns an empty list if no matching page is found or if the page is blocked.
     """
-    candidates = list(dict.fromkeys([entity, entity.title()]))  # deduplicate, preserve order
+    titled = entity.title()
+    candidates = [entity, titled]
+    # Also try all known prefixes (Races/X, Mobs/X, Abilities/Magics/X, etc.)
+    for prefix in _get_title_prefixes(collection):
+        candidates.append(f"{prefix}{titled}")
+    candidates = list(dict.fromkeys(candidates))  # deduplicate, preserve order
+
     for candidate in candidates:
         if _is_blocked(candidate):
             logger.debug("Bare entity %r is on blocklist, skipping", candidate)
@@ -323,7 +330,7 @@ def _query_by_page_title(collection, entity: str) -> list[dict]:
                     "page_title": meta.get("page_title", ""),
                     "section": meta.get("section", ""),
                     "url": meta.get("url", ""),
-                    "score": 1.0,  # exact metadata match — treat as maximally relevant
+                    "score": 1.0,
                 }
                 for text, meta in zip(result["documents"], result["metadatas"])
             ]
@@ -483,12 +490,15 @@ def query(question: str) -> list[dict]:
         page_chunks = _query_by_page_title(collection, entity)
         if page_chunks:
             return page_chunks
-        # Bare entity failed — check if it matches a category (e.g. "blessings?")
-        cat = _detect_category(question)
-        if cat:
-            cat_chunks = _query_category(collection, cat)
-            if cat_chunks:
-                return cat_chunks
+        # Bare entity failed — check if the ENTIRE entity is a category name
+        # (e.g. "Blessings?" → yes, "Magic Ore?" → no, "Anti skill?" → no).
+        # Only triggers when the entity has 1 word matching a category keyword.
+        if len(entity.split()) == 1:
+            cat = _detect_category(question)
+            if cat:
+                cat_chunks = _query_category(collection, cat)
+                if cat_chunks:
+                    return cat_chunks
 
     # Semantic search with query expansion and page title boosting
     k = K_COMPARATIVE if comparative else K_FACTUAL
@@ -498,4 +508,23 @@ def query(question: str) -> list[dict]:
     _inject_page_title_variant(collection, question, variants)
     logger.debug("Query variants (%d): %s", len(variants), variants)
 
-    return _semantic_search(collection, variants, k)
+    results = _semantic_search(collection, variants, k)
+
+    # Last resort: if semantic search returned nothing and we have a short entity,
+    # do a text-contains search across all chunks (catches sub-abilities like
+    # "Inspire" within Commander, or "Hero's Blessing" within Chosen One).
+    if not results and entity and len(entity) >= 4:
+        logger.debug("Semantic search empty for %r, trying text-contains fallback", entity)
+        all_chunks = collection.get(include=["documents", "metadatas"])
+        entity_lower = entity.lower()
+        text_matches = [
+            {"text": doc, "page_title": meta.get("page_title", ""),
+             "section": meta.get("section", ""), "url": meta.get("url", ""), "score": 0.5}
+            for doc, meta in zip(all_chunks["documents"], all_chunks["metadatas"])
+            if entity_lower in doc.lower() and not _is_blocked(meta.get("page_title", ""))
+        ]
+        if text_matches:
+            results = sorted(text_matches, key=lambda c: c["score"], reverse=True)[:k]
+            logger.info("Text-contains fallback: %d chunks for %r", len(results), entity)
+
+    return results
