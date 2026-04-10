@@ -219,11 +219,26 @@ def setup_events(client: discord.Client) -> None:
                 await message.reply(parts[0], mention_author=False)
                 for part in parts[1:]:
                     await message.channel.send(part)
-        except Exception:
+        except Exception as exc:
+            latency_ms = int((time.monotonic() - t_start) * 1000)
             logger.exception(
                 "Error handling message from user_id=%s in channel %s",
                 message.author.id,
                 message.channel.id,
+            )
+            # Structured log to conversations.log so failed queries are visible
+            # alongside successful ones (TEN-188). Uses chunks=-1 as a sentinel
+            # and model=error so log parsers can filter failures.
+            _convo_logger.info(
+                "user=%s channel=%s q=%r cleaned=%r chunks=-1 pages=[] scores=[] "
+                "model=error latency_ms=%d error=%s: %s",
+                message.author.id,
+                message.channel.id,
+                raw_content,
+                content,
+                latency_ms,
+                type(exc).__name__,
+                str(exc)[:200],
             )
             try:
                 await message.remove_reaction("⏳", client.user)
