@@ -6,13 +6,25 @@ Usage:
     python scripts/build_index.py --incremental # re-fetch only changed pages
     python scripts/build_index.py --cached      # re-index from disk cache, no API calls
     python scripts/build_index.py --refresh     # force re-fetch all pages then index
+
+Note: `--cached` does NOT prune deleted wiki pages (it is API-less by design).
+Run `--incremental` or `--refresh` to clean up orphaned cache files and chunks.
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from rag.scraper import fetch_all_pages, fetch_missing_pages, fetch_updated_pages, get_last_updated, load_cached_pages, prune_stale_redirects, set_last_updated
+from rag.scraper import (
+    fetch_all_pages,
+    fetch_missing_pages,
+    fetch_updated_pages,
+    get_last_updated,
+    load_cached_pages,
+    prune_deleted_pages,
+    prune_stale_redirects,
+    set_last_updated,
+)
 from rag.indexer import build_index, reindex_page, reset_collection
 
 
@@ -37,18 +49,28 @@ def main() -> None:
 
         if not pages_to_index:
             print("Index is already up to date.")
-            set_last_updated()
-            return
-        print(
-            f"\nRe-indexing {len(pages_to_index)} page(s) "
-            f"({len(updated_pages)} changed, {len(missing_pages)} previously missing, "
-            f"{len(stale_redirects)} stale redirects)..."
-        )
-        for page in pages_to_index:
-            print(f"  Updating: {page['title']}")
-            reindex_page(page)
+        else:
+            print(
+                f"\nRe-indexing {len(pages_to_index)} page(s) "
+                f"({len(updated_pages)} changed, {len(missing_pages)} previously missing, "
+                f"{len(stale_redirects)} stale redirects)..."
+            )
+            for page in pages_to_index:
+                print(f"  Updating: {page['title']}")
+                reindex_page(page)
+
+        print("\nPruning deleted pages...")
+        pruned = prune_deleted_pages()
+        if pruned:
+            print(f"  Pruned {len(pruned)} deleted page(s): {', '.join(pruned)}")
+        else:
+            print("  No deleted pages to prune.")
+
         set_last_updated()
-        print(f"Incremental update complete. {len(pages_to_index)} page(s) refreshed.")
+        print(
+            f"Incremental update complete. "
+            f"{len(pages_to_index)} page(s) refreshed, {len(pruned)} pruned."
+        )
 
     elif "--cached" in args:
         print("Loading pages from disk cache...")
@@ -73,6 +95,14 @@ def main() -> None:
         reset_collection()
         print(f"\nBuilding index for {len(pages)} pages...")
         build_index(pages)
+
+        print("\nPruning orphan cache files for deleted pages...")
+        pruned = prune_deleted_pages()
+        if pruned:
+            print(f"  Pruned {len(pruned)} deleted page(s): {', '.join(pruned)}")
+        else:
+            print("  No deleted pages to prune.")
+
         set_last_updated()
 
     print("\nDone. Verify with:")

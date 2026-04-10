@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 RATE_DELAY = 1.5        # seconds between successful requests
 RETRY_DELAYS = [30, 60, 120]  # seconds to wait on successive 429s
 
+# Safety rail for prune_deleted_pages(): abort if more than this fraction of
+# cached titles would be pruned in one pass. Protects the index from partial
+# `allpages()` responses (network/API hiccups) wiping good data.
+MAX_PRUNE_RATIO = 0.25
+
 
 def connect() -> mwclient.Site:
     return mwclient.Site(WIKI_HOST, path=WIKI_PATH)
@@ -120,9 +125,13 @@ def fetch_updated_pages(since: str) -> list[dict]:
     logger.info("Querying recentchanges since %s", since)
     # Query each type separately and merge — passing multiple types as a list
     # to mwclient reduces results instead of expanding them (API/library bug).
+    # namespace=0 restricts to main content pages so Template:/File:/User:/Category:
+    # edits don't get indexed as if they were wiki content (TEN-192).
     changed_titles: set[str] = set()
     for rc_type in ("edit", "new", "log"):
-        for change in site.recentchanges(end=since, dir="older", prop=["title"], type=[rc_type]):
+        for change in site.recentchanges(
+            end=since, dir="older", prop=["title"], type=[rc_type], namespace=0,
+        ):
             changed_titles.add(change["title"])
 
     logger.info("recentchanges returned %d title(s): %s", len(changed_titles), ", ".join(sorted(changed_titles)) or "(none)")
@@ -261,3 +270,117 @@ def load_cached_pages() -> list[dict]:
         except Exception as e:
             logger.warning("Could not read %s: %s", path, e)
     return pages
+
+
+def _cached_titles() -> set[str]:
+    """Return the set of page titles stored in the disk cache."""
+    if not CACHE_DIR.exists():
+        return set()
+    titles: set[str] = set()
+    for path in CACHE_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("Could not parse cache file %s: %s", path, e)
+            continue
+        title = data.get("title")
+        if title:
+            titles.add(title)
+    return titles
+
+
+def prune_deleted_pages() -> list[str]:
+    """Remove cached files and ChromaDB chunks for titles absent from the wiki.
+
+    The mirror of ``fetch_missing_pages``: diffs local state (disk cache +
+    ChromaDB metadata) against the live ``site.allpages()`` set and prunes
+    anything stored locally that is no longer on the wiki.
+
+    Safety rails:
+    * Aborts if ``allpages()`` returns no titles (treated as API failure).
+    * Aborts if the orphan set exceeds ``MAX_PRUNE_RATIO`` of cached titles,
+      on the assumption that a partial API response is wiping the index.
+
+    Returns the sorted list of titles that were pruned.
+    """
+    # Local import to avoid a scraper→indexer module-load edge case.
+    from rag.indexer import delete_page_chunks, get_collection
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    site = connect()
+
+    try:
+        wiki_titles = {page.name for page in site.allpages()}
+    except Exception as e:
+        logger.error("prune_deleted_pages: allpages() failed: %s — aborting", e)
+        return []
+
+    if not wiki_titles:
+        logger.error("prune_deleted_pages: allpages() returned 0 titles — aborting (treating as API failure)")
+        return []
+
+    # Collect everything the bot currently knows about: disk cache + Chroma metadata
+    cache_titles = _cached_titles()
+
+    collection = get_collection()
+    chroma_result = collection.get(include=["metadatas"])
+    chroma_titles: set[str] = set()
+    for meta in chroma_result.get("metadatas") or []:
+        if meta is None:
+            continue
+        title = meta.get("page_title")
+        if title:
+            chroma_titles.add(title)
+
+    local_titles = cache_titles | chroma_titles
+    orphans = sorted(local_titles - wiki_titles)
+
+    if not orphans:
+        logger.info(
+            "prune_deleted_pages: no orphans (wiki=%d, cache=%d, chroma=%d)",
+            len(wiki_titles), len(cache_titles), len(chroma_titles),
+        )
+        return []
+
+    # Safety rail — do not wipe the index on a partial API response
+    if cache_titles and len(orphans) / len(cache_titles) > MAX_PRUNE_RATIO:
+        logger.error(
+            "prune_deleted_pages: %d orphans would exceed %.0f%% of %d cached titles — "
+            "aborting as a safety measure. Run `--refresh` manually to force cleanup. "
+            "Orphans: %s",
+            len(orphans), MAX_PRUNE_RATIO * 100, len(cache_titles),
+            ", ".join(orphans[:20]) + (" ..." if len(orphans) > 20 else ""),
+        )
+        return []
+
+    logger.info(
+        "prune_deleted_pages: pruning %d orphan title(s): %s",
+        len(orphans), ", ".join(orphans),
+    )
+
+    pruned: list[str] = []
+    for title in orphans:
+        try:
+            delete_page_chunks(title)
+        except Exception as e:
+            logger.error("Failed to delete chunks for %r: %s", title, e)
+            continue
+        # Defensive: _cache_path raises ValueError on path-traversal attempts.
+        # Chunks have already been removed from Chroma at this point, so
+        # record the title as pruned even if we cannot unlink the cache file.
+        try:
+            path = _cache_path(title)
+        except ValueError as e:
+            logger.error("Unsafe cache path for %r, skipping unlink: %s", title, e)
+            pruned.append(title)
+            continue
+        if path.exists():
+            try:
+                path.unlink()
+            except Exception as e:
+                logger.error("Failed to unlink cache file %s: %s", path, e)
+                continue
+        pruned.append(title)
+
+    logger.info("prune_deleted_pages: %d title(s) pruned", len(pruned))
+    return pruned
