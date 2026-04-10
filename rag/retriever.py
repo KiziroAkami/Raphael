@@ -74,10 +74,36 @@ _BROAD_CATEGORIES: frozenset[str] = frozenset({
 })
 
 
+# Compound phrases where a category keyword appears as a noun modifier, not as
+# a category indicator. If a question contains the phrase, the associated
+# strategies are suppressed so the retriever does not route to the wrong
+# category. (TEN-187.) Add new entries as specific mis-routings are found.
+_COMPOUND_EXCLUSIONS: list[tuple[re.Pattern[str], frozenset[str]]] = [
+    # "magic ore" is a crafting material, not a spell. The "magic" substring
+    # would otherwise trigger the Abilities/Magics prefix category.
+    (
+        re.compile(r"\bmagic\s+ores?\b", re.IGNORECASE),
+        frozenset({"prefix:Abilities/Magics"}),
+    ),
+]
+
+
+def _suppressed_strategies(question: str) -> set[str]:
+    """Return the set of category strategies blocked by compound-term exclusions."""
+    suppressed: set[str] = set()
+    for pattern, strategies in _COMPOUND_EXCLUSIONS:
+        if pattern.search(question):
+            suppressed |= strategies
+    return suppressed
+
+
 def _detect_category(question: str, exclude_broad: bool = False) -> str | None:
     """Return the retrieval strategy if the question mentions a known category, or None."""
+    suppressed = _suppressed_strategies(question)
     for pattern, strategy in _CATEGORY_MAP:
         if pattern.search(question):
+            if strategy in suppressed:
+                continue
             if exclude_broad and strategy in _BROAD_CATEGORIES:
                 continue
             return strategy
@@ -117,7 +143,8 @@ def _fetch_category_chunks(collection, strategy: str) -> list[dict]:
             {"text": doc, "page_title": meta.get("page_title", ""),
              "section": meta.get("section", ""), "url": meta.get("url", ""), "score": 1.0}
             for doc, meta in zip(result["documents"], result["metadatas"])
-            if meta.get("page_title", "").startswith(value + "/")
+            if meta is not None
+            and meta.get("page_title", "").startswith(value + "/")
             and not _is_blocked(meta.get("page_title", ""))
         ]
     elif kind == "allcontent":
@@ -129,7 +156,9 @@ def _fetch_category_chunks(collection, strategy: str) -> list[dict]:
             {"text": doc, "page_title": meta.get("page_title", ""),
              "section": meta.get("section", ""), "url": meta.get("url", ""), "score": 1.0}
             for doc, meta in zip(result["documents"], result["metadatas"])
-            if value_lower in doc.lower() and not _is_blocked(meta.get("page_title", ""))
+            if meta is not None
+            and value_lower in doc.lower()
+            and not _is_blocked(meta.get("page_title", ""))
         ]
     else:
         # content: search summary chunks only
@@ -141,7 +170,9 @@ def _fetch_category_chunks(collection, strategy: str) -> list[dict]:
             {"text": doc, "page_title": meta.get("page_title", ""),
              "section": meta.get("section", ""), "url": meta.get("url", ""), "score": 1.0}
             for doc, meta in zip(result["documents"], result["metadatas"])
-            if value in doc and not _is_blocked(meta.get("page_title", ""))
+            if meta is not None
+            and value in doc
+            and not _is_blocked(meta.get("page_title", ""))
         ]
 
     chunks.sort(key=lambda c: c["page_title"])
@@ -176,10 +207,58 @@ def _condense_chunks(chunks: list[dict], verbose: bool = False) -> list[dict]:
     return condensed
 
 
+# Maps strategy prefixes to the human noun the LLM should mention when it
+# tells users the list was truncated. (TEN-190.)
+_STRATEGY_NOUN: dict[str, str] = {
+    "prefix:Races": "race",
+    "prefix:Mobs": "mob",
+    "prefix:Abilities/Magics": "spell",
+    "prefix:Abilities/Battlewills": "battlewill",
+    "prefix:Effects": "effect",
+    "prefix:Blocks": "block",
+    "prefix:Structures": "structure",
+    "prefix:Items/Schematics": "schematic",
+    "prefix:Items": "item",
+    "content:Unique Skill": "unique skill",
+    "content:Extra Skill": "extra skill",
+    "content:Common Skill": "common skill",
+    "content:Intrinsic Skill": "intrinsic skill",
+    "content:Resistance Skill": "resistance skill",
+    "content:Skill": "skill",
+    "allcontent:Blessing": "blessing",
+    "allcontent:Curse": "curse",
+    "allcontent:Engravings —": "engraving",
+}
+
+
+def _append_truncation_notice(
+    condensed: list[dict], total: int, strategy: str,
+) -> list[dict]:
+    """If condensation dropped entries, append an in-context truncation note.
+
+    The note is appended to the LAST kept chunk (immutably — no mutation) so
+    the LLM sees it inline with the wiki content and can mention the partial
+    nature of the list in its reply. Uses ``[Note: ...]`` as a distinctive
+    marker that won't be confused with wiki text. (TEN-190.)
+    """
+    dropped = total - len(condensed)
+    if dropped <= 0 or not condensed:
+        return condensed
+    noun = _STRATEGY_NOUN.get(strategy, "entry")
+    plural = noun + ("es" if noun.endswith(("s", "x", "ch", "sh")) else "s")
+    note = (
+        f"\n\n[Note: {dropped} additional {plural} omitted for length. "
+        f"Ask about a specific {noun} for full details.]"
+    )
+    last = condensed[-1]
+    return condensed[:-1] + [{**last, "text": last["text"] + note}]
+
+
 def _query_category(collection, strategy: str, verbose: bool = False) -> list[dict]:
     """Fetch and condense all summary chunks for a category."""
     chunks = _fetch_category_chunks(collection, strategy)
-    return _condense_chunks(chunks, verbose=verbose)
+    condensed = _condense_chunks(chunks, verbose=verbose)
+    return _append_truncation_notice(condensed, total=len(chunks), strategy=strategy)
 
 
 # Keywords that signal the user wants a comparison or recommendation
@@ -333,6 +412,7 @@ def _query_by_page_title(collection, entity: str) -> list[dict]:
                     "score": 1.0,
                 }
                 for text, meta in zip(result["documents"], result["metadatas"])
+                if meta is not None
             ]
     return []
 
@@ -356,6 +436,8 @@ def _get_title_prefixes(collection) -> list[str]:
         result = collection.get(include=["metadatas"])
         prefixes: set[str] = set()
         for meta in result["metadatas"]:
+            if meta is None:
+                continue
             title = meta.get("page_title", "")
             if "/" in title:
                 prefixes.add(title.rsplit("/", 1)[0] + "/")
@@ -447,6 +529,8 @@ def _semantic_search(collection, variants: list[str], k: int) -> list[dict]:
             results["metadatas"][0],
             results["distances"][0],
         ):
+            if meta is None:
+                continue
             score = 1.0 - (dist / 2.0)
             if score < RELEVANCE_THRESHOLD:
                 continue
@@ -463,6 +547,34 @@ def _semantic_search(collection, variants: list[str], k: int) -> list[dict]:
                 }
 
     return sorted(seen.values(), key=lambda c: c["score"], reverse=True)[:k]
+
+
+_MIN_TEXT_CONTAINS_ENTITY_LEN = 4
+
+
+def _text_contains_search(collection, entity: str, k: int, score: float) -> list[dict]:
+    """Word-boundary text scan across all chunks for an entity name.
+
+    Catches sub-abilities and character mentions that live inside parent pages
+    (e.g. "Gazel" inside Mobs/Dwarf, "Inspire" inside Commander). Uses a
+    ``\\b<entity>\\b`` regex so short tokens like "quest" don't match
+    "request"/"conquest". (TEN-189.)
+    """
+    if len(entity) < _MIN_TEXT_CONTAINS_ENTITY_LEN:
+        return []
+    pattern = re.compile(rf"\b{re.escape(entity)}\b", re.IGNORECASE)
+    all_chunks = collection.get(include=["documents", "metadatas"])
+    matches = [
+        {"text": doc, "page_title": meta.get("page_title", ""),
+         "section": meta.get("section", ""), "url": meta.get("url", ""), "score": score}
+        for doc, meta in zip(all_chunks["documents"], all_chunks["metadatas"])
+        if meta is not None
+        and pattern.search(doc)
+        and not _is_blocked(meta.get("page_title", ""))
+    ]
+    if not matches:
+        return []
+    return sorted(matches, key=lambda c: c["score"], reverse=True)[:k]
 
 
 def query(question: str) -> list[dict]:
@@ -499,6 +611,13 @@ def query(question: str) -> list[dict]:
                 cat_chunks = _query_category(collection, cat)
                 if cat_chunks:
                     return cat_chunks
+        # Page title + category both missed. Try a text-contains search BEFORE
+        # semantic, so entity mentions living inside other pages (e.g. "Gazel"
+        # inside Mobs/Dwarf) aren't masked by noisy weak semantic hits. (TEN-189.)
+        text_hits = _text_contains_search(collection, entity, k=K_FACTUAL, score=0.9)
+        if text_hits:
+            logger.info("Text-contains (bare entity): %d chunks for %r", len(text_hits), entity)
+            return text_hits
 
     # Semantic search with query expansion and page title boosting
     k = K_COMPARATIVE if comparative else K_FACTUAL
@@ -511,20 +630,11 @@ def query(question: str) -> list[dict]:
     results = _semantic_search(collection, variants, k)
 
     # Last resort: if semantic search returned nothing and we have a short entity,
-    # do a text-contains search across all chunks (catches sub-abilities like
-    # "Inspire" within Commander, or "Hero's Blessing" within Chosen One).
-    if not results and entity and len(entity) >= 4:
-        logger.debug("Semantic search empty for %r, trying text-contains fallback", entity)
-        all_chunks = collection.get(include=["documents", "metadatas"])
-        entity_lower = entity.lower()
-        text_matches = [
-            {"text": doc, "page_title": meta.get("page_title", ""),
-             "section": meta.get("section", ""), "url": meta.get("url", ""), "score": 0.5}
-            for doc, meta in zip(all_chunks["documents"], all_chunks["metadatas"])
-            if entity_lower in doc.lower() and not _is_blocked(meta.get("page_title", ""))
-        ]
-        if text_matches:
-            results = sorted(text_matches, key=lambda c: c["score"], reverse=True)[:k]
-            logger.info("Text-contains fallback: %d chunks for %r", len(results), entity)
+    # do a text-contains search across all chunks.
+    if not results and entity:
+        text_hits = _text_contains_search(collection, entity, k=k, score=0.5)
+        if text_hits:
+            logger.info("Text-contains fallback: %d chunks for %r", len(text_hits), entity)
+            results = text_hits
 
     return results
