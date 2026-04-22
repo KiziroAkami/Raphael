@@ -159,6 +159,9 @@ def setup_events(client: discord.Client) -> None:
     @client.event
     async def on_ready() -> None:
         logger.info("Raphael is online as %s", client.user)
+        await client.change_presence(
+            activity=discord.CustomActivity(name="End your question with '?' to ask me"),
+        )
 
         async def _go_invisible_and_exit() -> None:
             """Send invisible presence so Discord marks bot offline, then exit."""
