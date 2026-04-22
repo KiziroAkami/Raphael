@@ -335,14 +335,34 @@ _NORMALIZE_EXCLUDE: frozenset[str] = frozenset({
     "demon lord level",
 })
 
+# Player-facing stat abbreviations expanded to "Expansion (ABBREV)" form so
+# both literal token and full term land in the embedding. (TEN-200.) The wiki
+# uses only the abbreviations (0 mentions of the long form), so plain
+# replacement would steer the embedding away from real wiki content; keeping
+# both lets it match either way. Order matters: longer keys before shorter
+# ones (SHP before HP) to avoid partial overlap, though `\b` boundaries make
+# this defensive rather than strictly required.
+_ABBREVIATION_EXPANSIONS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bSHP\b"), "Soul Health Points (SHP)"),
+    (re.compile(r"\bEP\b"), "Evolution Points (EP)"),
+    (re.compile(r"\bMP\b"), "Magicule Points (MP)"),
+    (re.compile(r"\bHP\b"), "Health Points (HP)"),
+    (re.compile(r"\bAP\b"), "Attack Power (AP)"),
+]
+
 
 def _normalize_query(question: str) -> str:
     """Replace race-context phrases with wiki-canonical vocabulary.
 
-    Only maps known multi-word race phrases (e.g. "lesser demon" → "lesser daemon").
-    Leaves single-word "demon" untouched to avoid masking pages like Demon Essence.
-    Skips normalisation when the phrase is part of a compound entity name listed
-    in ``_NORMALIZE_EXCLUDE`` (e.g. "Demon Lord Haki").
+    Only maps known multi-word race phrases (e.g. ``lesser demon`` →
+    ``lesser daemon``). Leaves single-word ``demon`` untouched to avoid masking
+    pages like Demon Essence. Skips normalisation when the phrase is part of a
+    compound entity name listed in ``_NORMALIZE_EXCLUDE`` (e.g. ``Demon Lord Haki``).
+
+    Abbreviation expansion is intentionally NOT done here: it's a
+    semantic-only enrichment (TEN-200) and lives in ``_expand_abbreviations``
+    so it doesn't pollute the title-boost path with words like ``Magicule``
+    that match unrelated page titles (e.g. ``Effects/Magicule Poison``).
     """
     lower = question.lower().rstrip("?!.,;: ")
     for player_term, wiki_term in _RACE_SYNONYM_PHRASES.items():
@@ -359,6 +379,18 @@ def _normalize_query(question: str) -> str:
                 replacement = wiki_term
             question = question[:idx] + replacement + question[idx + len(player_term):]
             lower = question.lower().rstrip("?!.,;: ")
+    return question
+
+
+def _expand_abbreviations(question: str) -> str:
+    """Expand stat abbreviations to ``Expansion (ABBREV)`` form. (TEN-200.)
+
+    Used only for building semantic-search variants — keeps abbreviations
+    out of title-boost so ``MP`` doesn't pull in ``Magicule Poison`` etc.
+    Returns the original string when no abbreviation matches.
+    """
+    for pattern, expansion in _ABBREVIATION_EXPANSIONS:
+        question = pattern.sub(expansion, question)
     return question
 
 
@@ -629,26 +661,64 @@ _ENTITY_ACTION_VERBS: frozenset[str] = frozenset({
 })
 
 
-def _text_contains_search(collection, entity: str, k: int, score: float) -> list[dict]:
+_DYNAMIC_TC_BASE_SCORE = 0.55
+_DYNAMIC_TC_TITLE_BONUS = 0.25
+_DYNAMIC_TC_SUMMARY_BONUS = 0.10
+_DYNAMIC_TC_DENSITY_BONUS = 0.05    # per additional mention beyond the first
+_DYNAMIC_TC_DENSITY_CAP = 0.10
+
+
+def _text_contains_search(
+    collection, entity: str, k: int, score: float, dynamic: bool = False,
+) -> list[dict]:
     """Word-boundary text scan across all chunks for an entity name.
 
     Catches sub-abilities and character mentions that live inside parent pages
     (e.g. "Gazel" inside Mobs/Dwarf, "Inspire" inside Commander). Uses a
     ``\\b<entity>\\b`` regex so short tokens like "quest" don't match
     "request"/"conquest". (TEN-189.)
+
+    When ``dynamic=True``, drops chunks whose only signal is a single
+    incidental mention (no title match, not the summary chunk) and computes
+    per-chunk scores from page-title presence, summary placement, and density.
+    Used by the bare-entity full-phrase call to suppress noise from queries
+    like ``orb of domination?`` that match a single loot-table mention. (TEN-196.)
     """
     if len(entity) < _MIN_TEXT_CONTAINS_ENTITY_LEN:
         return []
     pattern = re.compile(rf"\b{re.escape(entity)}\b", re.IGNORECASE)
     all_chunks = collection.get(include=["documents", "metadatas"])
-    matches = [
-        {"text": doc, "page_title": meta.get("page_title", ""),
-         "section": meta.get("section", ""), "url": meta.get("url", ""), "score": score}
-        for doc, meta in zip(all_chunks["documents"], all_chunks["metadatas"])
-        if meta is not None
-        and pattern.search(doc)
-        and not _is_blocked(meta.get("page_title", ""))
-    ]
+    matches: list[dict] = []
+    for doc, meta in zip(all_chunks["documents"], all_chunks["metadatas"]):
+        if meta is None:
+            continue
+        page_title = meta.get("page_title", "")
+        if _is_blocked(page_title):
+            continue
+        if not pattern.search(doc):
+            continue
+        if dynamic:
+            title_match = bool(pattern.search(page_title))
+            is_summary = meta.get("section", "") == "_summary"
+            mentions = len(pattern.findall(doc))
+            # Filter incidental mentions: skip chunks whose only signal is
+            # one mention buried in a non-summary, non-title chunk.
+            if not title_match and not is_summary and mentions < 2:
+                continue
+            chunk_score = _DYNAMIC_TC_BASE_SCORE
+            if title_match:
+                chunk_score += _DYNAMIC_TC_TITLE_BONUS
+            if is_summary:
+                chunk_score += _DYNAMIC_TC_SUMMARY_BONUS
+            chunk_score += min(_DYNAMIC_TC_DENSITY_CAP, (mentions - 1) * _DYNAMIC_TC_DENSITY_BONUS)
+            chunk_score = min(score, chunk_score)
+        else:
+            chunk_score = score
+        matches.append({
+            "text": doc, "page_title": page_title,
+            "section": meta.get("section", ""), "url": meta.get("url", ""),
+            "score": chunk_score,
+        })
     if not matches:
         return []
     return sorted(matches, key=lambda c: c["score"], reverse=True)[:k]
@@ -726,7 +796,11 @@ def query(question: str) -> list[dict]:
         # Page title + category both missed. Try a text-contains search BEFORE
         # semantic, so entity mentions living inside other pages (e.g. "Gazel"
         # inside Mobs/Dwarf) aren't masked by noisy weak semantic hits. (TEN-189.)
-        text_hits = _text_contains_search(collection, entity, k=K_FACTUAL, score=0.9)
+        # Use dynamic scoring to suppress incidental single-mention hits
+        # (TEN-196) while keeping legitimate matches near 0.9.
+        text_hits = _text_contains_search(
+            collection, entity, k=K_FACTUAL, score=0.9, dynamic=True,
+        )
         if text_hits:
             logger.info("Text-contains (bare entity): %d chunks for %r", len(text_hits), entity)
             return text_hits
@@ -747,8 +821,13 @@ def query(question: str) -> list[dict]:
     for page_title in _find_title_hits_in_question(collection, question):
         direct_chunks.extend(_fetch_page_chunks(collection, page_title, score=0.95))
 
-    # Semantic search with query expansion
-    variants = [question] + expand_query(question)
+    # Semantic search with query expansion. Apply abbreviation expansion
+    # here so the embedding gets richer terms (e.g. "MP" → "Magicule Points
+    # (MP)") without those expansions polluting the title-boost path.
+    semantic_question = _expand_abbreviations(question)
+    variants = [semantic_question] + expand_query(semantic_question)
+    if semantic_question != question:
+        variants.insert(1, question)  # keep literal abbrev as a variant too
     if entity and entity not in variants:
         variants.append(entity)
     logger.debug("Query variants (%d): %s", len(variants), variants)
