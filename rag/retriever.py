@@ -1,3 +1,4 @@
+import difflib
 import logging
 import re
 import threading
@@ -53,6 +54,11 @@ _CATEGORY_MAP: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bengravings?\b", re.IGNORECASE), "allcontent:Engravings —"),
     # Prefix-based categories
     (re.compile(r"\braces?\b", re.IGNORECASE), "prefix:Races"),
+    # Otherworlders are individual Mobs/* pages carrying "Category:Otherworlders"
+    # in their Overview chunk. The category strategy finds them by that marker
+    # and returns their summary chunks so comparative queries
+    # ("Otherworlder with most EP?") enumerate them. (TEN-206.)
+    (re.compile(r"\botherworlders?\b", re.IGNORECASE), "category:Otherworlders"),
     (re.compile(r"\bmobs?\b", re.IGNORECASE), "prefix:Mobs"),
     (re.compile(r"\bmagics?\b|\bspells?\b", re.IGNORECASE), "prefix:Abilities/Magics"),
     (re.compile(r"\beffects?\b|\bstatus\s+effects?\b", re.IGNORECASE), "prefix:Effects"),
@@ -124,10 +130,42 @@ def _detect_enumeration(question: str) -> str | None:
 def _fetch_category_chunks(collection, strategy: str) -> list[dict]:
     """Fetch all summary chunks for a category, sorted by page title.
 
-    prefix strategies: all pages whose title starts with the given path.
-    content strategies: all summary chunks whose text contains the marker.
+    Strategies:
+    - ``prefix:X`` — pages whose title starts with ``X/``.
+    - ``content:X`` — summary chunks whose text contains the marker.
+    - ``allcontent:X`` — ANY chunks whose text contains the marker (used for
+      sub-categories that live inside a single page's sections).
+    - ``category:X`` — pages tagged with ``Category:X`` in any chunk; returns
+      those pages' summary chunks. Powers cross-prefix groupings like
+      otherworlders (which live under ``Mobs/*`` without a shared prefix).
     """
     kind, value = strategy.split(":", 1)
+
+    if kind == "category":
+        all_result = collection.get(include=["documents", "metadatas"])
+        marker = f"Category:{value}"
+        tagged_pages: set[str] = set()
+        for doc, meta in zip(all_result["documents"], all_result["metadatas"]):
+            if meta is None:
+                continue
+            if marker in doc:
+                tagged_pages.add(meta.get("page_title", ""))
+        if not tagged_pages:
+            return []
+        sum_result = collection.get(
+            where={"chunk_type": {"$eq": "summary"}},
+            include=["documents", "metadatas"],
+        )
+        chunks = [
+            {"text": doc, "page_title": meta.get("page_title", ""),
+             "section": meta.get("section", ""), "url": meta.get("url", ""), "score": 1.0}
+            for doc, meta in zip(sum_result["documents"], sum_result["metadatas"])
+            if meta is not None
+            and meta.get("page_title", "") in tagged_pages
+            and not _is_blocked(meta.get("page_title", ""))
+        ]
+        chunks.sort(key=lambda c: c["page_title"])
+        return chunks
 
     if kind == "prefix":
         result = collection.get(
@@ -225,6 +263,7 @@ _STRATEGY_NOUN: dict[str, str] = {
     "content:Intrinsic Skill": "intrinsic skill",
     "content:Resistance Skill": "resistance skill",
     "content:Skill": "skill",
+    "category:Otherworlders": "otherworlder",
     "allcontent:Blessing": "blessing",
     "allcontent:Curse": "curse",
     "allcontent:Engravings —": "engraving",
@@ -266,6 +305,8 @@ COMPARATIVE_KEYWORDS = {
     "best", "worst", "strongest", "weakest", "compare", "vs", "versus",
     "recommend", "recommended", "worth", "better", "worse", "which",
     "top", "ranking", "rank", "optimal", "most", "least",
+    "biggest", "largest", "highest", "smallest", "lowest", "greatest",
+    "fastest", "slowest", "hardest", "easiest",
 }
 
 # Pages that are broad mod overviews or navigation hubs — they score high for
@@ -276,14 +317,18 @@ _EXACT_BLOCKED: frozenset[str] = frozenset({
     "Abilities",
     "Effects",
     "Mobs",
-    "Config",
-    "Commands",
     "Crafting",
     "Skills",
     "Magic",
     "Races",
     "Items",
 })
+# Commands and Config were previously blocked as broad overviews, but that
+# left user queries about in-game commands or config options unable to
+# retrieve those dedicated pages. Unblocked in TEN-204 — the dynamic
+# text-contains scoring (TEN-196) now suppresses incidental mentions
+# sufficiently that Commands/Config only surface for queries that are
+# actually about them.
 
 _PREFIX_BLOCKED: tuple[str, ...] = (
     "Tensura: Reincarnated Wiki",  # blocks /welcome, /links, /contribute, /about
@@ -508,7 +553,53 @@ def _query_by_page_title(collection, entity: str) -> list[dict]:
         if chunks:
             logger.debug("Bare entity prefix-hit: %r → %r (%d chunks)", entity, unblocked[0], len(chunks))
             return chunks
+
+    # Fuzzy fallback: common misspellings like "Gormet" → "Gourmet",
+    # "unquie" → "Unique". Match the entity against the lowercase last
+    # component of every page title. Requires a tight cutoff (0.85) and a
+    # unique match so close-call ambiguity falls through to semantic. (TEN-199.)
+    fuzzy_match = _fuzzy_match_page_title(collection, entity)
+    if fuzzy_match is not None and not _is_blocked(fuzzy_match):
+        chunks = _fetch_page_chunks(collection, fuzzy_match, score=1.0)
+        if chunks:
+            logger.info("Bare entity fuzzy-hit: %r → %r (%d chunks)", entity, fuzzy_match, len(chunks))
+            return chunks
     return []
+
+
+_FUZZY_CUTOFF = 0.85
+_FUZZY_MIN_ENTITY_LEN = 5  # skip very short entities to avoid false positives
+
+
+def _fuzzy_match_page_title(collection, entity: str) -> str | None:
+    """Return a unique close-match page title for a potentially misspelled entity.
+
+    Compares the lowercase entity against the last-path-component of every
+    indexed page title using difflib's ratio. Returns the full page title
+    only if exactly one close match exists above ``_FUZZY_CUTOFF``. Skips
+    entities shorter than ``_FUZZY_MIN_ENTITY_LEN`` because short strings
+    collide often under ratio-based similarity. (TEN-199.)
+    """
+    if len(entity) < _FUZZY_MIN_ENTITY_LEN:
+        return None
+    entity_lower = entity.lower()
+    # Build {last-component.lower(): [full_titles]} from the existing index
+    idx = _get_title_word_prefix_index(collection)
+    # idx keys include multi-word prefixes; we want only the full last component.
+    # Pull unique full titles, then take their last-component for comparison.
+    seen_titles = {title for titles in idx.values() for title in titles}
+    last_components: dict[str, list[str]] = {}
+    for title in seen_titles:
+        last = title.rsplit("/", 1)[-1].lower()
+        last_components.setdefault(last, []).append(title)
+    close = difflib.get_close_matches(entity_lower, last_components.keys(), n=2, cutoff=_FUZZY_CUTOFF)
+    if len(close) != 1:
+        return None
+    # If the single closest component maps to multiple full titles, ambiguous — skip.
+    candidates = last_components[close[0]]
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
 
 
 _MAX_TITLE_BOOSTS = 3  # cap to avoid flooding variants on long queries
@@ -754,14 +845,18 @@ def _single_token_fallback(collection, entity: str, k: int) -> list[dict]:
     When the full multi-word phrase has zero matches, a single token often
     does: ``Spawn gazel Dwargo`` → ``Gazel`` inside ``Mobs/Dwarf``. Drops
     stopwords, action verbs, and tokens shorter than the text-contains
-    minimum. Scores slightly below full-phrase (0.85 vs 0.9) because a
-    single-token match is less specific. (TEN-203.)
+    minimum. Only considers tokens that start with an uppercase letter in
+    the user's original query — a proper-noun heuristic that prevents
+    common nouns like ``reduce``/``cast``/``time`` from matching thousands
+    of incidental mentions. Scores slightly below full-phrase (0.85 vs 0.9)
+    because a single-token match is less specific. (TEN-203.)
     """
     tokens = [
         t for t in entity.split()
         if t.lower() not in _QUESTION_STARTERS
         and t.lower() not in _ENTITY_ACTION_VERBS
         and len(t) >= _MIN_TEXT_CONTAINS_ENTITY_LEN
+        and t[:1].isupper()  # proper-noun heuristic — named entities are capitalised
     ]
     tokens.sort(key=len, reverse=True)  # longest first
     for tok in tokens:
