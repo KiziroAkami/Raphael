@@ -389,7 +389,7 @@ _NORMALIZE_EXCLUDE: frozenset[str] = frozenset({
 # this defensive rather than strictly required.
 _ABBREVIATION_EXPANSIONS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bSHP\b"), "Soul Health Points (SHP)"),
-    (re.compile(r"\bEP\b"), "Evolution Points (EP)"),
+    (re.compile(r"\bEP\b"), "Existence Points (EP)"),
     (re.compile(r"\bMP\b"), "Magicule Points (MP)"),
     (re.compile(r"\bHP\b"), "Health Points (HP)"),
     (re.compile(r"\bAP\b"), "Attack Power (AP)"),
