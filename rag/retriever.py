@@ -4,7 +4,7 @@ import re
 import threading
 
 from sentence_transformers import SentenceTransformer
-from rag.indexer import get_collection, EMBED_MODEL
+from rag.indexer import get_collection, EMBED_MODEL, INDEX_VERSION_FILE
 from llm.client import expand_query
 
 logger = logging.getLogger(__name__)
@@ -444,16 +444,23 @@ def _expand_abbreviations(question: str) -> str:
 # so the LLM answers in-character from system-prompt background knowledge
 # rather than weaving in irrelevant wiki chunks. (TEN-103.)
 _META_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\byou need\b", re.IGNORECASE),
+    # "you need a ?" — user asking about the trigger mechanism. Tight pattern
+    # to avoid catching wiki queries like "what EP do you need to evolve?" or
+    # "how much MP do you need for Unique?".
+    re.compile(r"\byou need a [?'\"]", re.IGNORECASE),
     re.compile(r"\bhow (?:do|should|would|can|did) (?:i|you|we) (?:ask|format|phrase|word|talk to|interact with)\b", re.IGNORECASE),
     re.compile(r"\bwhat (?:did|do|are) you (?:say|mean|think|doing)\b", re.IGNORECASE),
     re.compile(r"\bwho (?:are|made|created|built|wrote|programmed) you\b", re.IGNORECASE),
-    re.compile(r"\bare you (?:real|alive|ai|a bot|human|sentient|conscious|fake|sure|there|ok|good|broken|working)\b", re.IGNORECASE),
+    # Keep the identity-probe list tight — "sure"/"ok"/"good" false-positived on
+    # conversational wiki questions ("are you sure Predator exists?").
+    re.compile(r"\bare you (?:real|alive|ai|a bot|human|sentient|conscious|fake|there|broken|working|online|a robot|an ai)\b", re.IGNORECASE),
     re.compile(r"\bare you an? \w+\??$", re.IGNORECASE),
     re.compile(r"\b(?:my )?previous (?:message|question|answer|reply|response)\b", re.IGNORECASE),
     re.compile(r"\bhow (?:do|does) (?:this|the|your) bot\b", re.IGNORECASE),
     re.compile(r"\bwhat (?:is|are) your (?:name|purpose|function|origin)\b", re.IGNORECASE),
-    re.compile(r"\bwhy (?:do|does|are) you\b", re.IGNORECASE),
+    # "why do/does/are you X" needs a meta-specific continuation, otherwise
+    # it catches gameplay questions ("why do you use Predator for PvP?").
+    re.compile(r"\bwhy (?:do|does|are) you (?:think|feel|exist|work|respond|answer|act|claim|believe|know|say that)\b", re.IGNORECASE),
     re.compile(r"\bcan you (?:hear|see|understand|read) me\b", re.IGNORECASE),
 )
 
@@ -609,12 +616,47 @@ _TITLE_COMPONENT_MAX_WORDS = 4  # n-gram width for the word-prefix index
 # Built lazily on first use from the ChromaDB index.
 _title_prefixes: list[str] | None = None
 _title_word_prefix_index: dict[str, list[str]] | None = None
+_title_cache_built_at: float = 0.0  # epoch seconds; 0 = never built
 _title_prefixes_lock = threading.Lock()
+
+
+def _index_version_mtime() -> float:
+    """Return the index version file's mtime, or 0.0 if it doesn't exist.
+
+    Cross-process staleness signal. The sync cron (a separate process) calls
+    ``touch_index_version()`` after every index mutation; the bot process
+    compares this mtime against ``_title_cache_built_at`` to decide when to
+    rebuild in-memory caches without needing a bot restart."""
+    try:
+        return INDEX_VERSION_FILE.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _maybe_invalidate_title_caches() -> None:
+    """Clear cached title indexes if the on-disk index was updated since the
+    caches were built. Cheap (single stat call) and safe to call on every
+    query entrypoint."""
+    global _title_prefixes, _title_word_prefix_index
+    version_mtime = _index_version_mtime()
+    if version_mtime == 0.0:
+        return  # no version file yet — first run or pre-migration state
+    if _title_cache_built_at == 0.0 or version_mtime <= _title_cache_built_at:
+        return
+    with _title_prefixes_lock:
+        if version_mtime > _title_cache_built_at:
+            _title_prefixes = None
+            _title_word_prefix_index = None
+            logger.info(
+                "Title caches invalidated — index updated at %.0f, caches built at %.0f",
+                version_mtime, _title_cache_built_at,
+            )
 
 
 def _get_title_prefixes(collection) -> list[str]:
     """Return all page title prefixes sorted longest-first for greedy matching."""
     global _title_prefixes
+    _maybe_invalidate_title_caches()
     if _title_prefixes is not None:
         return _title_prefixes
     with _title_prefixes_lock:
@@ -637,6 +679,7 @@ def _get_title_word_prefix_index(collection) -> dict[str, list[str]]:
     lookup (TEN-198) and structured-question page boosts (TEN-201).
     """
     global _title_word_prefix_index
+    _maybe_invalidate_title_caches()
     if _title_word_prefix_index is not None:
         return _title_word_prefix_index
     with _title_prefixes_lock:
@@ -649,7 +692,10 @@ def _get_title_word_prefix_index(collection) -> dict[str, list[str]]:
 
 def _build_title_caches(collection) -> None:
     """Populate ``_title_prefixes`` and ``_title_word_prefix_index`` in one pass."""
-    global _title_prefixes, _title_word_prefix_index
+    global _title_prefixes, _title_word_prefix_index, _title_cache_built_at
+    # Stat BEFORE the read so that any update concurrent with our read is
+    # visible as a future mtime > our stamp, triggering re-invalidation.
+    mtime_at_start = _index_version_mtime() or 1.0
     result = collection.get(include=["metadatas"])
     prefixes: set[str] = set()
     word_index: dict[str, set[str]] = {}
@@ -672,6 +718,7 @@ def _build_title_caches(collection) -> None:
         k: sorted(v, key=lambda t: (len(t), t))
         for k, v in word_index.items()
     }
+    _title_cache_built_at = mtime_at_start
     logger.debug(
         "Built title caches: %d prefixes, %d word-prefix keys",
         len(_title_prefixes), len(_title_word_prefix_index),

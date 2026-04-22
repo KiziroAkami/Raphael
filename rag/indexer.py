@@ -8,6 +8,7 @@ from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
 CHROMA_DIR = Path(__file__).parent.parent / "data" / "chroma"
+INDEX_VERSION_FILE = Path(__file__).parent.parent / "data" / ".index_version"
 logger = logging.getLogger(__name__)
 COLLECTION_NAME = "tensura_wiki"
 EMBED_MODEL = "all-MiniLM-L6-v2"
@@ -70,6 +71,17 @@ def reset_collection() -> None:
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
+    touch_index_version()
+
+
+def touch_index_version() -> None:
+    """Bump the index version mtime so running bot processes know to invalidate
+    their module-level title caches. The retriever checks this file's mtime
+    before each cache-backed query. Cross-process safe because the sync cron
+    runs in a separate process and can't invalidate the bot's in-memory globals
+    directly."""
+    INDEX_VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    INDEX_VERSION_FILE.touch()
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +300,7 @@ def delete_page_chunks(page_title: str) -> None:
     """Remove all stored chunks for a single wiki page from ChromaDB."""
     collection = get_collection()
     collection.delete(where={"page_title": page_title})
+    touch_index_version()
 
 
 def reindex_page(page: dict) -> None:
@@ -335,4 +348,6 @@ def build_index(pages: list[dict], batch_size: int = 64) -> None:
         collection.upsert(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas)
         logger.info("Indexed %d/%d", min(start + batch_size, len(all_chunks)), len(all_chunks))
 
+    if all_chunks:
+        touch_index_version()
     logger.info("Index build complete.")
