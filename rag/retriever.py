@@ -394,6 +394,30 @@ def _expand_abbreviations(question: str) -> str:
     return question
 
 
+# Patterns that signal a meta-question about the bot itself, not a wiki query.
+# Matched questions skip retrieval and go straight to the LLM with no context,
+# so the LLM answers in-character from system-prompt background knowledge
+# rather than weaving in irrelevant wiki chunks. (TEN-103.)
+_META_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\byou need\b", re.IGNORECASE),
+    re.compile(r"\bhow (?:do|should|would|can|did) (?:i|you|we) (?:ask|format|phrase|word|talk to|interact with)\b", re.IGNORECASE),
+    re.compile(r"\bwhat (?:did|do|are) you (?:say|mean|think|doing)\b", re.IGNORECASE),
+    re.compile(r"\bwho (?:are|made|created|built|wrote|programmed) you\b", re.IGNORECASE),
+    re.compile(r"\bare you (?:real|alive|ai|a bot|human|sentient|conscious|fake|sure|there|ok|good|broken|working)\b", re.IGNORECASE),
+    re.compile(r"\bare you an? \w+\??$", re.IGNORECASE),
+    re.compile(r"\b(?:my )?previous (?:message|question|answer|reply|response)\b", re.IGNORECASE),
+    re.compile(r"\bhow (?:do|does) (?:this|the|your) bot\b", re.IGNORECASE),
+    re.compile(r"\bwhat (?:is|are) your (?:name|purpose|function|origin)\b", re.IGNORECASE),
+    re.compile(r"\bwhy (?:do|does|are) you\b", re.IGNORECASE),
+    re.compile(r"\bcan you (?:hear|see|understand|read) me\b", re.IGNORECASE),
+)
+
+
+def _is_meta_question(question: str) -> bool:
+    """Return True if the question is about the bot itself, not the wiki."""
+    return any(p.search(question) for p in _META_PATTERNS)
+
+
 _embedder: SentenceTransformer | None = None
 
 
@@ -767,6 +791,14 @@ def query(question: str) -> list[dict]:
     """
     collection = get_collection()
     question = _normalize_query(question)
+
+    # Meta-questions about the bot itself bypass retrieval entirely so the LLM
+    # answers in-character from system-prompt background knowledge instead of
+    # weaving in irrelevant wiki chunks. Returning [] funnels into the
+    # answer()-with-empty-chunks path. (TEN-103, TEN-179.)
+    if _is_meta_question(question):
+        logger.info("Meta-question detected — skipping retrieval: %r", question)
+        return []
 
     # Fast path: enumeration or comparative + category
     enum_strategy = _detect_enumeration(question)

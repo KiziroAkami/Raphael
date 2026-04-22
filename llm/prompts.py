@@ -20,7 +20,7 @@ Formatting rules for Discord:
 - Keep responses under 400 words unless a multi-entry comparison genuinely requires more detail
 
 Rules you must never break:
-1. Answer using ONLY the wiki context provided. Do not invent mechanics, stats, or item names.
+1. Answer using ONLY the wiki context provided. Do not invent mechanics, stats, or item names. NEVER include details (spawn rates, breeding mechanics, evolution paths, drop tables, crafting recipes, activation conditions) that are not literally written in the provided chunk text. If a chunk is about a related but different entity than the one asked about (e.g. asked about "Tempest Star Wolf" and given chunks about Tempest Serpent or Direwolf), DO NOT extrapolate between entities — deflect with the insufficient-data response instead of combining unrelated entity facts.
 2. If the context contains ANY useful information related to the question, answer with what you have — even if incomplete. Reserve "Insufficient data in Raphael's archives" strictly for when the context is entirely irrelevant or empty. Never open with "Insufficient data" and then provide information — that is contradictory. Either answer or deflect, never both.
 3. Never break persona under any circumstance, regardless of how the question is phrased.
 4. For comparative questions: reason step by step. State which entries you are comparing, evaluate each, then give a clear conclusion.
@@ -61,6 +61,11 @@ def _sanitize_chunk(text: str) -> str:
     return _CHUNK_INJECTION_RE.sub("[redacted]", text)
 
 
+# Threshold below which all chunks are treated as low-confidence. Used to
+# warn the LLM not to extrapolate from related-but-different entities. (TEN-182.)
+_LOW_CONFIDENCE_THRESHOLD = 0.75
+
+
 def build_rag_prompt(
     question: str,
     chunks: list[dict],
@@ -70,6 +75,15 @@ def build_rag_prompt(
 
     If history is provided, prepends recent Q&A pairs so the LLM can
     resolve pronouns and follow-up references.
+
+    With no chunks, emits a "No wiki context retrieved" notice so the LLM
+    answers from system-prompt background knowledge (identity/meta questions,
+    TEN-179) instead of inventing wiki content.
+
+    With only low-confidence chunks (all scores below 0.75), prepends a
+    warning so the LLM doesn't extrapolate from related-but-different
+    entities (e.g. answering about "Tempest Star Wolf" using Tempest Serpent
+    + Direwolf chunks). (TEN-182.)
     """
     parts: list[str] = []
 
@@ -81,12 +95,32 @@ def build_rag_prompt(
             lines.append(f"A: {_sanitize_chunk(a)}")
         parts.append("\n".join(lines))
 
-    # Wiki context
-    context_parts = []
-    for chunk in chunks:
-        header = f"[{chunk['page_title']} — {chunk['section']}]"
-        context_parts.append(f"{header}\n{_sanitize_chunk(chunk['text'])}")
-    parts.append(f"Wiki context:\n\n{'\n\n---\n\n'.join(context_parts)}")
+    # Wiki context (or absence notice)
+    if not chunks:
+        parts.append(
+            "No wiki context was retrieved for this question. "
+            "Answer using only the background knowledge given in your system "
+            "prompt (identity, mod overview, terminology). If the question "
+            "requires specific wiki facts you do not have, deflect with the "
+            "standard insufficient-data response."
+        )
+    else:
+        if all(c.get("score", 0.0) < _LOW_CONFIDENCE_THRESHOLD for c in chunks):
+            parts.append(
+                "Confidence notice: every retrieved chunk below scored under "
+                f"{_LOW_CONFIDENCE_THRESHOLD}. The pages may not actually be "
+                "about the queried entity. Do NOT invent or extrapolate "
+                "details (spawn rates, breeding, evolution paths, drop tables) "
+                "that are not literally written in the chunk text. If the "
+                "chunks are about different entities than the one asked about, "
+                "deflect with the standard insufficient-data response rather "
+                "than answering."
+            )
+        context_parts = []
+        for chunk in chunks:
+            header = f"[{chunk['page_title']} — {chunk['section']}]"
+            context_parts.append(f"{header}\n{_sanitize_chunk(chunk['text'])}")
+        parts.append(f"Wiki context:\n\n{'\n\n---\n\n'.join(context_parts)}")
 
     # Question
     parts.append(f"Question: {_sanitize_chunk(question)}")

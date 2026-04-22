@@ -134,10 +134,11 @@ def answer(
 
     Walks MODEL_CHAIN in order, falling back on RateLimitError.
     Returns (response_text, model_used).
-    """
-    if not chunks:
-        return _INSUFFICIENT_DATA, "none"
 
+    With empty chunks, still calls the LLM so identity/meta questions can be
+    answered from system-prompt background knowledge. (TEN-179.) The prompt
+    builder injects an explicit "no wiki context" instruction in that case.
+    """
     user_message = build_rag_prompt(question, chunks, history=history)
 
     for i, model in enumerate(MODEL_CHAIN):
