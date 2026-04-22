@@ -326,16 +326,30 @@ _RACE_SYNONYM_PHRASES: dict[str, str] = {
     "demon slime": "demon slime",
 }
 
+# Compound page names that contain a race-synonym phrase as a prefix but refer
+# to a different entity (skill, item, etc.).  Normalisation is skipped when any
+# of these appear in the query so "Demon Lord Haki" stays intact.
+_NORMALIZE_EXCLUDE: frozenset[str] = frozenset({
+    "demon lord haki",
+    "demon lord-level",
+    "demon lord level",
+})
+
 
 def _normalize_query(question: str) -> str:
     """Replace race-context phrases with wiki-canonical vocabulary.
 
     Only maps known multi-word race phrases (e.g. "lesser demon" → "lesser daemon").
     Leaves single-word "demon" untouched to avoid masking pages like Demon Essence.
+    Skips normalisation when the phrase is part of a compound entity name listed
+    in ``_NORMALIZE_EXCLUDE`` (e.g. "Demon Lord Haki").
     """
     lower = question.lower().rstrip("?!.,;: ")
     for player_term, wiki_term in _RACE_SYNONYM_PHRASES.items():
         if player_term in lower:
+            # Skip if the matched phrase is part of a longer compound term
+            if any(excl in lower for excl in _NORMALIZE_EXCLUDE if player_term in excl):
+                continue
             # Case-preserving replacement
             idx = lower.find(player_term)
             original = question[idx:idx + len(player_term)]
@@ -379,16 +393,41 @@ def _bare_entity_name(question: str) -> str | None:
     return text
 
 
+def _fetch_page_chunks(collection, page_title: str, score: float) -> list[dict]:
+    """Return all chunks for a given page_title as result dicts, or [] if not found."""
+    result = collection.get(
+        where={"page_title": {"$eq": page_title}},
+        include=["documents", "metadatas"],
+    )
+    if not result["documents"]:
+        return []
+    return [
+        {
+            "text": text,
+            "page_title": meta.get("page_title", ""),
+            "section": meta.get("section", ""),
+            "url": meta.get("url", ""),
+            "score": score,
+        }
+        for text, meta in zip(result["documents"], result["metadatas"])
+        if meta is not None
+    ]
+
+
 def _query_by_page_title(collection, entity: str) -> list[dict]:
     """Return all chunks for a wiki page matching the entity name.
 
-    Tries the entity as-is, title-cased, and with all known wiki prefixes
-    (e.g. "Alignment" → "Races/Alignment", "Inspire" → checked under all prefixes).
+    First tries exact matches: the entity as-is, title-cased, and under each
+    known wiki prefix (e.g. ``Alignment`` → ``Races/Alignment``).
+
+    If no exact match, consults the word-prefix index so that partial lookups
+    like ``hinata`` surface ``Mobs/Hinata Sakaguchi``. Returns the chunks of
+    the shortest matching page (most specific). (TEN-198.)
+
     Returns an empty list if no matching page is found or if the page is blocked.
     """
     titled = entity.title()
     candidates = [entity, titled]
-    # Also try all known prefixes (Races/X, Mobs/X, Abilities/Magics/X, etc.)
     for prefix in _get_title_prefixes(collection):
         candidates.append(f"{prefix}{titled}")
     candidates = list(dict.fromkeys(candidates))  # deduplicate, preserve order
@@ -397,31 +436,32 @@ def _query_by_page_title(collection, entity: str) -> list[dict]:
         if _is_blocked(candidate):
             logger.debug("Bare entity %r is on blocklist, skipping", candidate)
             continue
-        result = collection.get(
-            where={"page_title": {"$eq": candidate}},
-            include=["documents", "metadatas"],
-        )
-        if result["documents"]:
-            logger.debug("Bare entity hit: page_title=%r (%d chunks)", candidate, len(result["documents"]))
-            return [
-                {
-                    "text": text,
-                    "page_title": meta.get("page_title", ""),
-                    "section": meta.get("section", ""),
-                    "url": meta.get("url", ""),
-                    "score": 1.0,
-                }
-                for text, meta in zip(result["documents"], result["metadatas"])
-                if meta is not None
-            ]
+        chunks = _fetch_page_chunks(collection, candidate, score=1.0)
+        if chunks:
+            logger.debug("Bare entity hit: page_title=%r (%d chunks)", candidate, len(chunks))
+            return chunks
+
+    # Word-prefix fallback: "hinata" matches "Mobs/Hinata Sakaguchi".
+    # Only commit to a match when it's unambiguous — otherwise "fire?" (8
+    # candidates) would arbitrarily snap to "Fire Ball". When ambiguous, fall
+    # through to semantic search where ranking can disambiguate by context.
+    idx = _get_title_word_prefix_index(collection)
+    unblocked = [t for t in idx.get(entity.lower(), []) if not _is_blocked(t)]
+    if len(unblocked) == 1:
+        chunks = _fetch_page_chunks(collection, unblocked[0], score=1.0)
+        if chunks:
+            logger.debug("Bare entity prefix-hit: %r → %r (%d chunks)", entity, unblocked[0], len(chunks))
+            return chunks
     return []
 
 
 _MAX_TITLE_BOOSTS = 3  # cap to avoid flooding variants on long queries
+_TITLE_COMPONENT_MAX_WORDS = 4  # n-gram width for the word-prefix index
 
 # Cache of all page title prefixes (e.g. "Races/", "Mobs/", "Abilities/Magics/")
 # Built lazily on first use from the ChromaDB index.
 _title_prefixes: list[str] | None = None
+_title_word_prefix_index: dict[str, list[str]] | None = None
 _title_prefixes_lock = threading.Lock()
 
 
@@ -433,77 +473,108 @@ def _get_title_prefixes(collection) -> list[str]:
     with _title_prefixes_lock:
         if _title_prefixes is not None:
             return _title_prefixes
-        result = collection.get(include=["metadatas"])
-        prefixes: set[str] = set()
-        for meta in result["metadatas"]:
-            if meta is None:
-                continue
-            title = meta.get("page_title", "")
-            if "/" in title:
-                prefixes.add(title.rsplit("/", 1)[0] + "/")
-        _title_prefixes = sorted(prefixes, key=len, reverse=True)
-        logger.debug("Loaded %d page title prefixes", len(_title_prefixes))
+        _build_title_caches(collection)
+        assert _title_prefixes is not None
     return _title_prefixes
 
 
-def _inject_page_title_variant(
-    collection, question: str, variants: list[str],
-) -> None:
-    """If words in the question match page titles, add them as search variants.
+def _get_title_word_prefix_index(collection) -> dict[str, list[str]]:
+    """Return {lowercase-word-prefix: [matching_page_titles]} index.
 
-    Prevents common terms ("cooldown", "damage") from drowning entity names
-    ("creator", "predator") in the embedding. Checks 1-, 2-, and 3-word windows
-    from the question against ChromaDB page titles.
+    The last path component of each page title contributes 1..N word-prefixes:
+    ``Mobs/Hinata Sakaguchi`` contributes keys ``"hinata"`` and ``"hinata sakaguchi"``.
+    ``Chosen One`` contributes keys ``"chosen"`` and ``"chosen one"``.
 
-    For multi-entity queries ("hero as a giant?"), injects ALL matching page
-    titles (up to _MAX_TITLE_BOOSTS) so both entities get retrieval coverage.
+    Matching values are deduplicated and sorted by path length so the most
+    specific (shortest) match appears first. This powers both bare-entity
+    lookup (TEN-198) and structured-question page boosts (TEN-201).
+    """
+    global _title_word_prefix_index
+    if _title_word_prefix_index is not None:
+        return _title_word_prefix_index
+    with _title_prefixes_lock:
+        if _title_word_prefix_index is not None:
+            return _title_word_prefix_index
+        _build_title_caches(collection)
+        assert _title_word_prefix_index is not None
+    return _title_word_prefix_index
+
+
+def _build_title_caches(collection) -> None:
+    """Populate ``_title_prefixes`` and ``_title_word_prefix_index`` in one pass."""
+    global _title_prefixes, _title_word_prefix_index
+    result = collection.get(include=["metadatas"])
+    prefixes: set[str] = set()
+    word_index: dict[str, set[str]] = {}
+    for meta in result["metadatas"]:
+        if meta is None:
+            continue
+        title = meta.get("page_title", "")
+        if not title:
+            continue
+        if "/" in title:
+            prefixes.add(title.rsplit("/", 1)[0] + "/")
+        last = title.rsplit("/", 1)[-1]
+        words = last.split()
+        limit = min(len(words), _TITLE_COMPONENT_MAX_WORDS)
+        for n in range(1, limit + 1):
+            key = " ".join(words[:n]).lower()
+            word_index.setdefault(key, set()).add(title)
+    _title_prefixes = sorted(prefixes, key=len, reverse=True)
+    _title_word_prefix_index = {
+        k: sorted(v, key=lambda t: (len(t), t))
+        for k, v in word_index.items()
+    }
+    logger.debug(
+        "Built title caches: %d prefixes, %d word-prefix keys",
+        len(_title_prefixes), len(_title_word_prefix_index),
+    )
+
+
+def _find_title_hits_in_question(collection, question: str) -> list[str]:
+    """Return page titles whose last-component word-prefix matches phrases in the question.
+
+    Scans n-grams of length 3..1 (longest first, most specific). For each phrase
+    that matches the word-prefix index, picks the shortest matching page title
+    (most specific). Caps at ``_MAX_TITLE_BOOSTS`` to avoid flooding variants on
+    long queries. Skips phrases already covered by a longer matching phrase.
+
+    Used by ``query()`` to directly inject matching page chunks (TEN-201) — a
+    successor to the older "title as semantic variant" approach, which failed
+    for short generic titles like ``Chosen One`` that embed to noise.
     """
     words = question.rstrip("?").strip().split()
-    # Skip question-starter words for candidate generation
     content_words = [w for w in words if w.lower() not in _QUESTION_STARTERS]
     if not content_words:
-        return
+        return []
 
-    # Build candidate phrases: trigrams first (more specific), then bigrams, then unigrams
-    candidates: list[str] = []
+    idx = _get_title_word_prefix_index(collection)
+    hits: list[str] = []
+    matched_words: set[str] = set()
+
     for size in (3, 2, 1):
-        for i in range(len(content_words) - size + 1):
-            phrase = " ".join(content_words[i:i + size])
-            if len(phrase) >= 3:  # skip very short candidates
-                candidates.append(phrase)
-
-    boosts = 0
-    matched_words: set[str] = set()  # track which words already matched to avoid subset dupes
-    for phrase in candidates:
-        if boosts >= _MAX_TITLE_BOOSTS:
+        if len(hits) >= _MAX_TITLE_BOOSTS:
             break
-        if phrase in variants:
-            continue
-        # Skip if all words in this phrase were already matched by a longer phrase
-        phrase_words = set(phrase.lower().split())
-        if phrase_words <= matched_words:
-            continue
-        # Try exact page title match, then every known prefix (Races/X, Mobs/X, etc.)
-        titled = phrase.title()
-        forms = [phrase, titled]
-        for prefix in _get_title_prefixes(collection):
-            forms.append(f"{prefix}{titled}")
-        # Deduplicate while preserving order
-        forms = list(dict.fromkeys(forms))
-        for form in forms:
-            if _is_blocked(form):
-                continue
-            result = collection.get(
-                where={"page_title": {"$eq": form}},
-                include=["metadatas"],
-                limit=1,
-            )
-            if result["ids"]:
-                logger.debug("Page title boost: %r matches page %r", phrase, form)
-                variants.append(form)
-                matched_words.update(phrase_words)
-                boosts += 1
+        for i in range(len(content_words) - size + 1):
+            if len(hits) >= _MAX_TITLE_BOOSTS:
                 break
+            phrase = " ".join(content_words[i:i + size]).lower()
+            if len(phrase) < 3:
+                continue
+            phrase_words = set(phrase.split())
+            if phrase_words <= matched_words:
+                continue
+            # Require an unambiguous match: single-word phrases like "fire"
+            # often hit 8+ pages and shouldn't arbitrarily snap to one.
+            # Multi-word phrases like "chosen one" usually resolve uniquely.
+            candidates = [t for t in idx.get(phrase, []) if not _is_blocked(t) and t not in hits]
+            if len(candidates) != 1:
+                continue
+            chosen = candidates[0]
+            hits.append(chosen)
+            matched_words.update(phrase_words)
+            logger.debug("Title boost: phrase %r → page %r", phrase, chosen)
+    return hits
 
 
 def _semantic_search(collection, variants: list[str], k: int) -> list[dict]:
@@ -551,6 +622,12 @@ def _semantic_search(collection, variants: list[str], k: int) -> list[dict]:
 
 _MIN_TEXT_CONTAINS_ENTITY_LEN = 4
 
+# Action verbs to strip when falling back to single-token text-contains on a
+# multi-word entity (TEN-203). "Spawn gazel Dwargo" → drop "spawn", search "Gazel"/"Dwargo".
+_ENTITY_ACTION_VERBS: frozenset[str] = frozenset({
+    "spawn", "summon", "get", "make", "find", "kill", "give", "craft", "build",
+})
+
 
 def _text_contains_search(collection, entity: str, k: int, score: float) -> list[dict]:
     """Word-boundary text scan across all chunks for an entity name.
@@ -577,11 +654,46 @@ def _text_contains_search(collection, entity: str, k: int, score: float) -> list
     return sorted(matches, key=lambda c: c["score"], reverse=True)[:k]
 
 
+def _single_token_fallback(collection, entity: str, k: int) -> list[dict]:
+    """Retry text-contains on each content word of a multi-word entity.
+
+    When the full multi-word phrase has zero matches, a single token often
+    does: ``Spawn gazel Dwargo`` → ``Gazel`` inside ``Mobs/Dwarf``. Drops
+    stopwords, action verbs, and tokens shorter than the text-contains
+    minimum. Scores slightly below full-phrase (0.85 vs 0.9) because a
+    single-token match is less specific. (TEN-203.)
+    """
+    tokens = [
+        t for t in entity.split()
+        if t.lower() not in _QUESTION_STARTERS
+        and t.lower() not in _ENTITY_ACTION_VERBS
+        and len(t) >= _MIN_TEXT_CONTAINS_ENTITY_LEN
+    ]
+    tokens.sort(key=len, reverse=True)  # longest first
+    for tok in tokens:
+        hits = _text_contains_search(collection, tok, k=k, score=0.85)
+        if hits:
+            logger.info("Single-token fallback: %r → %d chunks via %r", entity, len(hits), tok)
+            return hits
+    return []
+
+
+def _merge_results(direct: list[dict], semantic: list[dict], k: int) -> list[dict]:
+    """Merge direct-page hits and semantic hits, dedup by chunk text, sort by score."""
+    seen: dict[str, dict] = {}
+    for c in list(direct) + list(semantic):
+        text = c["text"]
+        if text not in seen or c["score"] > seen[text]["score"]:
+            seen[text] = c
+    return sorted(seen.values(), key=lambda c: c["score"], reverse=True)[:k]
+
+
 def query(question: str) -> list[dict]:
     """Embed the question, search ChromaDB, and return the most relevant chunks.
 
-    Routing order: enumeration/comparative → bare entity → semantic search.
-    Each returned dict has keys: text, page_title, section, url, score.
+    Routing order: enumeration/comparative → bare entity → direct page-title
+    hits + semantic → text-contains fallbacks. Each returned dict has keys:
+    text, page_title, section, url, score.
     """
     collection = get_collection()
     question = _normalize_query(question)
@@ -618,18 +730,34 @@ def query(question: str) -> list[dict]:
         if text_hits:
             logger.info("Text-contains (bare entity): %d chunks for %r", len(text_hits), entity)
             return text_hits
+        # Full phrase missed. For multi-word entities, retry on individual
+        # tokens so "Gazel Dwargo" / "Spawn gazel Dwargo" surface Mobs/Dwarf
+        # mentions. (TEN-203.)
+        if " " in entity:
+            token_hits = _single_token_fallback(collection, entity, k=K_FACTUAL)
+            if token_hits:
+                return token_hits
 
-    # Semantic search with query expansion and page title boosting
+    # Direct page-title hits for structured queries (TEN-201).
+    # Finds pages whose titles appear in the question and fetches their chunks
+    # at score 0.95 — higher than typical semantic hits, so they rise to the
+    # top even when the page's title embeds poorly (e.g. "Chosen One").
     k = K_COMPARATIVE if comparative else K_FACTUAL
+    direct_chunks: list[dict] = []
+    for page_title in _find_title_hits_in_question(collection, question):
+        direct_chunks.extend(_fetch_page_chunks(collection, page_title, score=0.95))
+
+    # Semantic search with query expansion
     variants = [question] + expand_query(question)
     if entity and entity not in variants:
         variants.append(entity)
-    _inject_page_title_variant(collection, question, variants)
     logger.debug("Query variants (%d): %s", len(variants), variants)
 
-    results = _semantic_search(collection, variants, k)
+    semantic_chunks = _semantic_search(collection, variants, k)
 
-    # Last resort: if semantic search returned nothing and we have a short entity,
+    results = _merge_results(direct_chunks, semantic_chunks, k) if direct_chunks else semantic_chunks
+
+    # Last resort: if search returned nothing and we have a short entity,
     # do a text-contains search across all chunks.
     if not results and entity:
         text_hits = _text_contains_search(collection, entity, k=k, score=0.5)
